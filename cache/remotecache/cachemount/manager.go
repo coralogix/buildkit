@@ -2,6 +2,8 @@ package cachemount
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -10,6 +12,7 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/util/bklog"
+	"github.com/moby/buildkit/util/progress"
 	"github.com/pkg/errors"
 )
 
@@ -200,6 +203,23 @@ func (m *Manager) RunExports(ctx context.Context, cm cache.Manager, g session.Gr
 	}
 	m.exportsMu.Unlock()
 
+	// Debug: List all cache mounts in the system
+	allCacheMounts, err := cm.Search(ctx, cacheDirIndex, true)
+	if err != nil {
+		bklog.G(ctx).WithError(err).Warn("failed to list all cache mounts for debugging")
+	} else {
+		bklog.G(ctx).Infof("found %d total cache mounts in the system", len(allCacheMounts))
+		for i, md := range allCacheMounts {
+			// Get the cache-dir value to see the actual key
+			v := md.Get(keyCacheDir)
+			if v != nil {
+				bklog.G(ctx).Infof("cache mount %d: id=%s, cache-dir-value=%s, cache-dir-index=%s", i, md.ID(), string(v.Value), v.Index)
+			} else {
+				bklog.G(ctx).Infof("cache mount %d: id=%s (no cache-dir metadata)", i, md.ID())
+			}
+		}
+	}
+
 	results := make(map[string]*ExportResult)
 
 	for id, entry := range exports {
@@ -218,17 +238,26 @@ func (m *Manager) RunExports(ctx context.Context, cm cache.Manager, g session.Gr
 var ErrCacheMountNotFound = errors.New("cache mount not found")
 
 func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *ExportEntry, g session.Group) (*ExportResult, error) {
+	bklog.G(ctx).Infof("performing export for cache mount %s (type=%s)", entry.ID, entry.Type)
+
 	switch entry.Type {
 	case "registry":
+		bklog.G(ctx).Debugf("looking for cache mount %s to export", entry.ID)
 		// Get the cache mount path (createIfMissing=false to avoid exporting empty caches)
 		sourcePath, cleanup, err := m.getCacheMountPath(ctx, cm, entry.ID, g, false)
 		if err != nil {
 			if errors.Is(err, ErrCacheMountNotFound) {
-				bklog.G(ctx).Warnf("skipping export of cache mount %s: not found or never used", entry.ID)
+				skipDone := progress.OneOff(ctx, fmt.Sprintf("skipping cache mount export %s: not found", entry.ID))
+				skipDone(nil)
+				bklog.G(ctx).Warnf("skipping export of cache mount %s: %v", entry.ID, err)
 				return nil, nil
 			}
+			bklog.G(ctx).WithError(err).Errorf("failed to get cache mount path for export: %s", entry.ID)
 			return nil, errors.Wrapf(err, "failed to get cache mount path for export: %s", entry.ID)
 		}
+		bklog.G(ctx).Infof("found cache mount %s at %s, starting export", entry.ID, sourcePath)
+		exportDone := progress.OneOff(ctx, fmt.Sprintf("exporting cache mount %s to registry", entry.ID))
+		defer func() { exportDone(nil) }()
 		defer cleanup()
 
 		exporterFunc := RegistryCacheMountExporterFunc(m.sm, m.hosts)
@@ -262,21 +291,47 @@ func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *Ex
 // If createIfMissing is true, a new cache mount ref will be created if none exists.
 // If createIfMissing is false and the cache mount doesn't exist, ErrCacheMountNotFound is returned.
 func (m *Manager) getCacheMountPath(ctx context.Context, cm cache.Manager, id string, g session.Group, createIfMissing bool) (string, func(), error) {
-	// Search for existing cache mount using prefix matching to find cache mounts
-	// that may have been created with a parent ref (key format: "cache-dir:id:refId")
-	key := cacheDirIndex + id + ":"
-	mds, err := cm.Search(ctx, key, true) // withNested=true for prefix matching
-	if err != nil {
-		return "", nil, err
+	// The Dockerfile frontend prefixes cache mount IDs with "/" + namespace.
+	// If no namespace is set, the ID becomes "/<id>" (e.g., "/registry" for id=registry).
+	// We need to search for both variants: with and without the leading slash.
+	searchIDs := []string{id}
+	if !strings.HasPrefix(id, "/") {
+		// Also try with leading slash (default namespace format)
+		searchIDs = append(searchIDs, "/"+id)
 	}
 
-	// Also search for exact match (cache mounts created without parent ref)
-	if len(mds) == 0 {
-		key = cacheDirIndex + id
-		mds, err = cm.Search(ctx, key, false)
+	var mds []cache.RefMetadata
+	var err error
+
+	for _, searchID := range searchIDs {
+		// Search with prefix matching to find cache mounts with parent ref suffix
+		prefixKey := cacheDirIndex + searchID + ":"
+		bklog.G(ctx).Debugf("searching for cache mount with prefix key: %s", prefixKey)
+		mds, err = cm.Search(ctx, prefixKey, true)
 		if err != nil {
 			return "", nil, err
 		}
+		if len(mds) > 0 {
+			bklog.G(ctx).Debugf("prefix search found %d results for cache mount %s (searched: %s)", len(mds), id, searchID)
+			break
+		}
+
+		// Also search for exact match (cache mounts created without parent ref)
+		exactKey := cacheDirIndex + searchID
+		bklog.G(ctx).Debugf("searching for cache mount with exact key: %s", exactKey)
+		mds, err = cm.Search(ctx, exactKey, false)
+		if err != nil {
+			return "", nil, err
+		}
+		if len(mds) > 0 {
+			bklog.G(ctx).Debugf("exact search found %d results for cache mount %s (searched: %s)", len(mds), id, searchID)
+			break
+		}
+	}
+
+	// Log what we found
+	for i, md := range mds {
+		bklog.G(ctx).Debugf("found cache mount candidate %d: id=%s", i, md.ID())
 	}
 
 	var mref cache.MutableRef
@@ -307,20 +362,27 @@ func (m *Manager) getCacheMountPath(ctx context.Context, cm cache.Manager, id st
 			bklog.G(ctx).Debugf("cache mount %s not found (searched %d refs, locked=%v)", id, len(mds), locked)
 			return "", nil, errors.Wrapf(ErrCacheMountNotFound, "cache mount %s does not exist", id)
 		}
-		bklog.G(ctx).Debugf("creating new ref for cache mount %s", id)
+
+		// The Dockerfile frontend stores cache mounts with "/" prefix (default namespace).
+		// We need to use the same format so the build can find imported cache mounts.
+		storageID := id
+		if !strings.HasPrefix(id, "/") {
+			storageID = "/" + id
+		}
+		bklog.G(ctx).Debugf("creating new ref for cache mount %s (storage key: %s)", id, storageID)
 
 		// Create new ref for import
 		mref, err = cm.New(ctx, nil, g,
 			cache.WithRecordType("exec.cachemount"),
-			cache.WithDescription("cache mount "+id),
+			cache.WithDescription("cache mount "+storageID),
 			cache.CachePolicyRetain,
 		)
 		if err != nil {
 			return "", nil, err
 		}
 
-		// Set the cache dir index so this cache mount can be found later
-		if err := mref.SetString(keyCacheDir, id, cacheDirIndex+id); err != nil {
+		// Set the cache dir index using the format expected by the Dockerfile frontend
+		if err := mref.SetString(keyCacheDir, storageID, cacheDirIndex+storageID); err != nil {
 			mref.Release(context.Background())
 			return "", nil, err
 		}
