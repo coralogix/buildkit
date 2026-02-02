@@ -262,30 +262,52 @@ func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *Ex
 // If createIfMissing is true, a new cache mount ref will be created if none exists.
 // If createIfMissing is false and the cache mount doesn't exist, ErrCacheMountNotFound is returned.
 func (m *Manager) getCacheMountPath(ctx context.Context, cm cache.Manager, id string, g session.Group, createIfMissing bool) (string, func(), error) {
-	// Search for existing cache mount
-	key := cacheDirIndex + id
-	mds, err := cm.Search(ctx, key, false)
+	// Search for existing cache mount using prefix matching to find cache mounts
+	// that may have been created with a parent ref (key format: "cache-dir:id:refId")
+	key := cacheDirIndex + id + ":"
+	mds, err := cm.Search(ctx, key, true) // withNested=true for prefix matching
 	if err != nil {
 		return "", nil, err
 	}
 
-	var mref cache.MutableRef
-	if len(mds) > 0 {
-		// Try to get existing ref
-		mref, err = cm.GetMutable(ctx, mds[0].ID())
-		if err != nil && !errors.Is(err, cache.ErrLocked) {
+	// Also search for exact match (cache mounts created without parent ref)
+	if len(mds) == 0 {
+		key = cacheDirIndex + id
+		mds, err = cm.Search(ctx, key, false)
+		if err != nil {
 			return "", nil, err
 		}
-		// If locked and we're not creating, return not found
-		if mref == nil && !createIfMissing {
+	}
+
+	var mref cache.MutableRef
+	var locked bool
+	if len(mds) > 0 {
+		bklog.G(ctx).Debugf("found %d potential refs for cache mount %s", len(mds), id)
+		// Try to get existing ref, iterating through all matches
+		for _, md := range mds {
+			mref, err = cm.GetMutable(ctx, md.ID())
+			if err == nil {
+				bklog.G(ctx).Debugf("using ref %s for cache mount %s", md.ID(), id)
+				break
+			} else if errors.Is(err, cache.ErrLocked) {
+				locked = true
+				bklog.G(ctx).Debugf("ref %s for cache mount %s is locked", md.ID(), id)
+			} else {
+				bklog.G(ctx).WithError(err).Warnf("failed to get ref %s for cache mount %s", md.ID(), id)
+			}
+		}
+		// If all refs are locked and we're not creating, return not found
+		if mref == nil && locked && !createIfMissing {
 			return "", nil, errors.Wrapf(ErrCacheMountNotFound, "cache mount %s is locked", id)
 		}
 	}
 
 	if mref == nil {
 		if !createIfMissing {
+			bklog.G(ctx).Debugf("cache mount %s not found (searched %d refs, locked=%v)", id, len(mds), locked)
 			return "", nil, errors.Wrapf(ErrCacheMountNotFound, "cache mount %s does not exist", id)
 		}
+		bklog.G(ctx).Debugf("creating new ref for cache mount %s", id)
 
 		// Create new ref for import
 		mref, err = cm.New(ctx, nil, g,
