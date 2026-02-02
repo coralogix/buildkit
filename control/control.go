@@ -394,7 +394,6 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 	translateLegacySolveRequest(req)
 
 	// Handle cache mount imports/exports if specified
-	var cacheMountManager *cachemount.Manager
 	if len(req.Cache.CacheMountImports) > 0 || len(req.Cache.CacheMountExports) > 0 {
 		w, err := c.opt.WorkerController.GetDefault()
 		if err != nil {
@@ -405,42 +404,49 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 		if hosts == nil {
 			hosts = resolver.NewRegistryConfig(nil)
 		}
-		cacheMountManager = cachemount.NewManager(c.opt.SessionManager, hosts, nil)
+		cacheMountManager := cachemount.NewManager(c.opt.SessionManager, hosts, nil)
 
-		// Add imports to the manager
+		// Add imports and exports to the manager
 		for _, imp := range req.Cache.CacheMountImports {
 			cacheMountManager.AddImport(cachemount.NewImportEntry(imp.ID, imp.Type, imp.Attrs))
 		}
-
-		// Add exports to the manager
 		for _, exp := range req.Cache.CacheMountExports {
 			cacheMountManager.AddExport(cachemount.NewExportEntry(exp.ID, exp.Type, exp.Attrs))
 		}
 
-		// Perform imports before the solve
-		bklog.G(ctx).Infof("starting cache mount imports for %d entries", len(req.Cache.CacheMountImports))
-		g := session.NewGroup(req.Session)
-		for _, imp := range req.Cache.CacheMountImports {
-			bklog.G(ctx).Infof("importing cache mount %s (type=%s, ref=%s)", imp.ID, imp.Type, imp.Attrs["ref"])
-			if imported, err := cacheMountManager.TryImport(ctx, cm, imp.ID, g); err != nil {
-				bklog.G(ctx).WithError(err).Warnf("failed to import cache mount %s", imp.ID)
-			} else if imported {
-				bklog.G(ctx).Infof("successfully imported cache mount %s", imp.ID)
+		// Perform imports before the solve starts
+		// We need to wait for the session to be ready first (with timeout)
+		if len(req.Cache.CacheMountImports) > 0 {
+			importCtx, importCancel := context.WithTimeout(ctx, 60*time.Second)
+			// Wait for session to be available
+			if _, err := c.opt.SessionManager.Get(importCtx, req.Session, false); err != nil {
+				importCancel()
+				bklog.G(ctx).WithError(err).Warn("session not ready for cache mount imports, skipping")
+			} else {
+				importCancel()
+				g := session.NewGroup(req.Session)
+				for _, imp := range req.Cache.CacheMountImports {
+					// Use a separate context for each import so one failure doesn't affect others
+					impCtx, impCancel := context.WithTimeout(ctx, 120*time.Second)
+					if imported, err := cacheMountManager.TryImport(impCtx, cm, imp.ID, g); err != nil {
+						bklog.G(ctx).WithError(err).Debugf("failed to import cache mount %s (this is normal for first build)", imp.ID)
+					} else if imported {
+						bklog.G(ctx).Debugf("imported cache mount %s", imp.ID)
+					}
+					impCancel()
+				}
 			}
 		}
-		bklog.G(ctx).Infof("completed cache mount imports")
 
-		// Defer export until after the solve completes
+		// Defer exports until after the solve completes
 		defer func() {
 			if len(req.Cache.CacheMountExports) > 0 {
-				// Recover from any panics during export to prevent daemon crash
 				defer func() {
 					if r := recover(); r != nil {
 						bklog.G(ctx).Errorf("panic during cache mount export: %v", r)
 					}
 				}()
 
-				bklog.G(ctx).Infof("starting cache mount exports for %d entries", len(req.Cache.CacheMountExports))
 				g := session.NewGroup(req.Session)
 				results, err := cacheMountManager.RunExports(ctx, cm, g)
 				if err != nil {
@@ -451,7 +457,6 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 						bklog.G(ctx).Infof("exported cache mount %s to %s (digest: %s)", id, result.Ref, result.Digest)
 					}
 				}
-				bklog.G(ctx).Infof("completed cache mount exports")
 			}
 		}()
 	}

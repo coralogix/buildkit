@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
@@ -169,25 +170,40 @@ func (m *Manager) TryImport(ctx context.Context, cm cache.Manager, id string, g 
 func (m *Manager) performImport(ctx context.Context, cm cache.Manager, entry *ImportEntry, g session.Group) error {
 	switch entry.Type {
 	case "registry":
+		ref := entry.Attrs["ref"]
+		importDone := progress.OneOff(ctx, fmt.Sprintf("[cache mount] importing %s from %s", entry.ID, ref))
+		startTime := time.Now()
+
 		importerFunc := RegistryCacheMountImporterFunc(m.sm, m.cs, m.hosts)
 		importer, _, err := importerFunc(ctx, g, entry.Attrs)
 		if err != nil {
+			// If the cache doesn't exist in the registry, that's expected for first-time builds
+			if errors.Is(err, ErrCacheNotFound) {
+				importDone(nil) // Mark as done without error
+				bklog.G(ctx).Debugf("cache mount %s not found in registry (first build?), skipping import", entry.ID)
+				return nil
+			}
+			importDone(err)
 			return errors.Wrapf(err, "failed to create registry importer for %s", entry.ID)
 		}
 
 		// Get or create the cache mount ref (createIfMissing=true for imports)
 		destPath, cleanup, err := m.getCacheMountPath(ctx, cm, entry.ID, g, true)
 		if err != nil {
+			importDone(err)
 			return errors.Wrapf(err, "failed to get cache mount path for import: %s", entry.ID)
 		}
 		defer cleanup()
 
 		// Perform the import
 		if err := importer.Import(ctx, entry.ID, destPath); err != nil {
+			importDone(err)
 			return errors.Wrapf(err, "failed to import cache mount %s", entry.ID)
 		}
 
-		bklog.G(ctx).Infof("successfully imported cache mount %s from registry", entry.ID)
+		elapsed := time.Since(startTime)
+		importDone(nil)
+		bklog.G(ctx).Infof("successfully imported cache mount %s from registry in %s", entry.ID, elapsed.Round(time.Millisecond))
 		return nil
 	default:
 		return errors.Errorf("unsupported cache mount import type: %s", entry.Type)
@@ -238,6 +254,7 @@ func (m *Manager) RunExports(ctx context.Context, cm cache.Manager, g session.Gr
 var ErrCacheMountNotFound = errors.New("cache mount not found")
 
 func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *ExportEntry, g session.Group) (*ExportResult, error) {
+	ref := entry.Attrs["ref"]
 	bklog.G(ctx).Infof("performing export for cache mount %s (type=%s)", entry.ID, entry.Type)
 
 	switch entry.Type {
@@ -247,7 +264,7 @@ func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *Ex
 		sourcePath, cleanup, err := m.getCacheMountPath(ctx, cm, entry.ID, g, false)
 		if err != nil {
 			if errors.Is(err, ErrCacheMountNotFound) {
-				skipDone := progress.OneOff(ctx, fmt.Sprintf("skipping cache mount export %s: not found", entry.ID))
+				skipDone := progress.OneOff(ctx, fmt.Sprintf("[cache mount] skipping %s: not found", entry.ID))
 				skipDone(nil)
 				bklog.G(ctx).Warnf("skipping export of cache mount %s: %v", entry.ID, err)
 				return nil, nil
@@ -255,31 +272,38 @@ func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *Ex
 			bklog.G(ctx).WithError(err).Errorf("failed to get cache mount path for export: %s", entry.ID)
 			return nil, errors.Wrapf(err, "failed to get cache mount path for export: %s", entry.ID)
 		}
-		bklog.G(ctx).Infof("found cache mount %s at %s, starting export", entry.ID, sourcePath)
-		exportDone := progress.OneOff(ctx, fmt.Sprintf("exporting cache mount %s to registry", entry.ID))
-		defer func() { exportDone(nil) }()
 		defer cleanup()
+
+		exportDone := progress.OneOff(ctx, fmt.Sprintf("[cache mount] exporting %s to %s", entry.ID, ref))
+		startTime := time.Now()
+
+		bklog.G(ctx).Infof("found cache mount %s at %s, starting export", entry.ID, sourcePath)
 
 		exporterFunc := RegistryCacheMountExporterFunc(m.sm, m.hosts)
 		exporter, err := exporterFunc(ctx, g, entry.Attrs)
 		if err != nil {
+			exportDone(err)
 			return nil, errors.Wrapf(err, "failed to create registry exporter for %s", entry.ID)
 		}
 
 		// Perform the export
 		desc, err := exporter.Export(ctx, entry.ID, sourcePath)
 		if err != nil {
+			exportDone(err)
 			return nil, errors.Wrapf(err, "failed to export cache mount %s", entry.ID)
 		}
 
 		if _, err := exporter.Finalize(ctx); err != nil {
+			exportDone(err)
 			return nil, errors.Wrapf(err, "failed to finalize cache mount export %s", entry.ID)
 		}
 
-		bklog.G(ctx).Infof("successfully exported cache mount %s to registry", entry.ID)
+		elapsed := time.Since(startTime)
+		exportDone(nil)
+		bklog.G(ctx).Infof("successfully exported cache mount %s to %s in %s", entry.ID, ref, elapsed.Round(time.Millisecond))
 		return &ExportResult{
 			ID:     entry.ID,
-			Ref:    entry.Attrs["ref"],
+			Ref:    ref,
 			Digest: desc.Digest.String(),
 		}, nil
 	default:

@@ -3,6 +3,7 @@ package cachemount
 import (
 	"context"
 	"strconv"
+	"strings"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
@@ -71,6 +72,9 @@ func (*registryImporter) Name() string {
 	return "importing cache mount from registry"
 }
 
+// ErrCacheNotFound is returned when a cache mount image doesn't exist in the registry
+var ErrCacheNotFound = errors.New("cache mount not found in registry")
+
 // RegistryCacheMountImporterFunc returns a resolver function for registry-based cache mount import
 func RegistryCacheMountImporterFunc(sm *session.Manager, cs content.Store, hosts docker.RegistryHosts) ResolveCacheMountImporterFunc {
 	return func(ctx context.Context, g session.Group, attrs map[string]string) (Importer, ocispecs.Descriptor, error) {
@@ -94,6 +98,15 @@ func RegistryCacheMountImporterFunc(sm *session.Manager, cs content.Store, hosts
 
 		xref, desc, err := remote.Resolve(ctx, refString)
 		if err != nil {
+			// Check if this is a "not found" error - this is expected for first-time builds
+			errStr := err.Error()
+			if strings.Contains(errStr, "not found") ||
+				strings.Contains(errStr, "404") ||
+				strings.Contains(errStr, "manifest unknown") ||
+				strings.Contains(errStr, "MANIFEST_UNKNOWN") ||
+				strings.Contains(errStr, "NAME_UNKNOWN") {
+				return nil, ocispecs.Descriptor{}, errors.Wrapf(ErrCacheNotFound, "ref %s: %v", refString, err)
+			}
 			return nil, ocispecs.Descriptor{}, err
 		}
 
