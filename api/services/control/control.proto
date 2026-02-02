@@ -97,6 +97,23 @@ message CacheOptions {
 	repeated CacheOptionsEntry Exports = 4;
 	// Imports was introduced in BuildKit v0.4.0.
 	repeated CacheOptionsEntry Imports = 5;
+	// CacheMountExports specifies cache mounts to export to remote storage
+	repeated CacheMountEntry CacheMountExports = 6;
+	// CacheMountImports specifies cache mounts to import from remote storage
+	repeated CacheMountEntry CacheMountImports = 7;
+}
+
+// CacheMountEntry defines a cache mount export/import configuration
+message CacheMountEntry {
+	// ID is the cache mount identifier (e.g., "gocache", "npm")
+	string ID = 1;
+	// Type specifies the storage backend type (e.g., "registry", "local", "s3")
+	string Type = 2;
+	// Attrs contains backend-specific attributes
+	// For registry: ref=myregistry/cache:tag
+	// For local: dest=/path/to/cache
+	// For s3: bucket=mybucket, region=us-east-1
+	map<string, string> Attrs = 3;
 }
 
 message CacheOptionsEntry {

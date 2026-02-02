@@ -45,6 +45,8 @@ type SolveOpt struct {
 	FrontendInputs        map[string]llb.State
 	CacheExports          []CacheOptionsEntry
 	CacheImports          []CacheOptionsEntry
+	CacheMountExports     []CacheMountEntry // Export cache mounts to remote storage
+	CacheMountImports     []CacheMountEntry // Import cache mounts from remote storage
 	Session               []session.Attachable
 	AllowedEntitlements   []string
 	SharedSession         *session.Session // TODO: refactor to better session syncing
@@ -53,6 +55,16 @@ type SolveOpt struct {
 	SourcePolicy          *spb.Policy
 	SourcePolicyProvider  session.Attachable
 	Ref                   string
+}
+
+// CacheMountEntry defines a cache mount export/import configuration
+type CacheMountEntry struct {
+	// ID is the cache mount identifier (e.g., "gocache", "npm")
+	ID string
+	// Type specifies the storage backend type (e.g., "registry", "local", "s3")
+	Type string
+	// Attrs contains backend-specific attributes
+	Attrs map[string]string
 }
 
 type ExportEntry struct {
@@ -567,10 +579,55 @@ func parseCacheOptions(ctx context.Context, isGateway bool, opt SolveOpt) (*cach
 			frontendAttrs["cache-imports"] = string(s)
 		}
 	}
+
+	// Process cache mount exports
+	var cacheMountExports []*controlapi.CacheMountEntry
+	for _, ex := range opt.CacheMountExports {
+		if ex.ID == "" {
+			return nil, errors.New("cache mount export requires id")
+		}
+		if ex.Type == "" {
+			return nil, errors.New("cache mount export requires type")
+		}
+		if ex.Type == "registry" {
+			if ex.Attrs["ref"] == "" {
+				return nil, errors.New("registry cache mount export requires ref")
+			}
+		}
+		cacheMountExports = append(cacheMountExports, &controlapi.CacheMountEntry{
+			ID:    ex.ID,
+			Type:  ex.Type,
+			Attrs: ex.Attrs,
+		})
+	}
+
+	// Process cache mount imports
+	var cacheMountImports []*controlapi.CacheMountEntry
+	for _, im := range opt.CacheMountImports {
+		if im.ID == "" {
+			return nil, errors.New("cache mount import requires id")
+		}
+		if im.Type == "" {
+			return nil, errors.New("cache mount import requires type")
+		}
+		if im.Type == "registry" {
+			if im.Attrs["ref"] == "" {
+				return nil, errors.New("registry cache mount import requires ref")
+			}
+		}
+		cacheMountImports = append(cacheMountImports, &controlapi.CacheMountEntry{
+			ID:    im.ID,
+			Type:  im.Type,
+			Attrs: im.Attrs,
+		})
+	}
+
 	res := cacheOptions{
 		options: controlapi.CacheOptions{
-			Exports: cacheExports,
-			Imports: cacheImports,
+			Exports:           cacheExports,
+			Imports:           cacheImports,
+			CacheMountExports: cacheMountExports,
+			CacheMountImports: cacheMountImports,
 		},
 		contentStores:  contentStores,
 		storesToUpdate: storesToUpdate,

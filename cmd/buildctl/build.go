@@ -84,6 +84,14 @@ var buildCommand = cli.Command{
 			Usage: "Import build cache, e.g. --import-cache type=registry,ref=example.com/foo/bar, or --import-cache type=local,src=path/to/dir",
 		},
 		cli.StringSliceFlag{
+			Name:  "cache-mount-export",
+			Usage: "Export cache mount as OCI artifact, e.g. --cache-mount-export id=gocache,type=registry,ref=example.com/cache:go",
+		},
+		cli.StringSliceFlag{
+			Name:  "cache-mount-import",
+			Usage: "Import cache mount from OCI artifact, e.g. --cache-mount-import id=gocache,type=registry,ref=example.com/cache:go",
+		},
+		cli.StringSliceFlag{
 			Name:  "secret",
 			Usage: "Secret value exposed to the build. Format id=secretname,src=filepath",
 		},
@@ -231,6 +239,15 @@ func buildAction(clicontext *cli.Context) error {
 		return err
 	}
 
+	cacheMountExports, err := build.ParseCacheMountEntry(clicontext.StringSlice("cache-mount-export"))
+	if err != nil {
+		return err
+	}
+	cacheMountImports, err := build.ParseCacheMountEntry(clicontext.StringSlice("cache-mount-import"))
+	if err != nil {
+		return err
+	}
+
 	var srcPol *spb.Policy
 	if srcPolFile := clicontext.String("source-policy-file"); srcPolFile != "" {
 		b, err := os.ReadFile(srcPolFile)
@@ -256,6 +273,8 @@ func buildAction(clicontext *cli.Context) error {
 		// OCILayouts is set later
 		CacheExports:        cacheExports,
 		CacheImports:        cacheImports,
+		CacheMountExports:   cacheMountExports,
+		CacheMountImports:   cacheMountImports,
 		Session:             attachable,
 		AllowedEntitlements: clicontext.StringSlice("allow"),
 		SourcePolicy:        srcPol,

@@ -12,12 +12,14 @@ import (
 
 	contentapi "github.com/containerd/containerd/api/services/content/v1"
 	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/plugins/services/content/contentserver"
 	"github.com/distribution/reference"
 	"github.com/mitchellh/hashstructure/v2"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	apitypes "github.com/moby/buildkit/api/types"
 	"github.com/moby/buildkit/cache/remotecache"
+	"github.com/moby/buildkit/cache/remotecache/cachemount"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/cmd/buildkitd/config"
@@ -42,6 +44,7 @@ import (
 	"github.com/moby/buildkit/util/entitlements"
 	"github.com/moby/buildkit/util/imageutil"
 	"github.com/moby/buildkit/util/leaseutil"
+	"github.com/moby/buildkit/util/resolver"
 	"github.com/moby/buildkit/util/throttle"
 	"github.com/moby/buildkit/util/tracing/transform"
 	"github.com/moby/buildkit/version"
@@ -75,6 +78,8 @@ type Opt struct {
 	GarbageCollect            func(context.Context) error
 	GracefulStop              <-chan struct{}
 	ProvenanceEnv             map[string]any
+	// RegistryHosts is used for cache mount import/export to registries
+	RegistryHosts docker.RegistryHosts
 }
 
 type Controller struct { // TODO: ControlService
@@ -387,6 +392,53 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 		req.Cache = &controlapi.CacheOptions{} // make sure cache options are initialized
 	}
 	translateLegacySolveRequest(req)
+
+	// Handle cache mount imports/exports if specified
+	var cacheMountManager *cachemount.Manager
+	if len(req.Cache.CacheMountImports) > 0 || len(req.Cache.CacheMountExports) > 0 {
+		w, err := c.opt.WorkerController.GetDefault()
+		if err != nil {
+			return nil, err
+		}
+		cm := w.CacheManager()
+		hosts := c.opt.RegistryHosts
+		if hosts == nil {
+			hosts = resolver.NewRegistryConfig(nil)
+		}
+		cacheMountManager = cachemount.NewManager(c.opt.SessionManager, hosts, nil)
+
+		// Add imports to the manager
+		for _, imp := range req.Cache.CacheMountImports {
+			cacheMountManager.AddImport(cachemount.NewImportEntry(imp.ID, imp.Type, imp.Attrs))
+		}
+
+		// Add exports to the manager
+		for _, exp := range req.Cache.CacheMountExports {
+			cacheMountManager.AddExport(cachemount.NewExportEntry(exp.ID, exp.Type, exp.Attrs))
+		}
+
+		// Perform imports before the solve
+		g := session.NewGroup(req.Session)
+		for _, imp := range req.Cache.CacheMountImports {
+			if _, err := cacheMountManager.TryImport(ctx, cm, imp.ID, g); err != nil {
+				bklog.G(ctx).WithError(err).Warnf("failed to import cache mount %s", imp.ID)
+			}
+		}
+
+		// Defer export until after the solve completes
+		defer func() {
+			if len(req.Cache.CacheMountExports) > 0 {
+				g := session.NewGroup(req.Session)
+				results, err := cacheMountManager.RunExports(ctx, cm, g)
+				if err != nil {
+					bklog.G(ctx).WithError(err).Warn("failed to run cache mount exports")
+				}
+				for id, result := range results {
+					bklog.G(ctx).Infof("exported cache mount %s to %s (digest: %s)", id, result.Ref, result.Digest)
+				}
+			}
+		}()
+	}
 
 	defer func() {
 		time.AfterFunc(time.Second, c.throttledGC)
