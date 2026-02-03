@@ -444,7 +444,8 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 					go func(impID, ref string, importDone func(bool)) {
 						// Use InBuilderContext to show progress vertex
 						err := llbsolver.InBuilderContext(progressCtx, j, fmt.Sprintf("[cache mount] importing %s", impID), "", func(ctx context.Context, _ solver.JobContext) error {
-							impCtx, impCancel := context.WithTimeout(ctx, 120*time.Second)
+							// Use 10 minute timeout for large cache imports
+							impCtx, impCancel := context.WithTimeout(ctx, 600*time.Second)
 							defer impCancel()
 
 							if imported, err := cacheMountManager.TryImport(impCtx, cacheMgr, impID, g); err != nil {

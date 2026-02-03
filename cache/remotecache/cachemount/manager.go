@@ -116,6 +116,12 @@ func RegisterImportTracker(sessionID string, tracker *ImportTracker) {
 	globalTrackersMu.Lock()
 	defer globalTrackersMu.Unlock()
 	globalTrackers[sessionID] = tracker
+	// Log all registered trackers for debugging
+	var keys []string
+	for k := range globalTrackers {
+		keys = append(keys, k)
+	}
+	bklog.G(context.TODO()).Debugf("[cache mount] registered import tracker for session %s, all sessions: %v", sessionID, keys)
 }
 
 // UnregisterImportTracker removes the import tracker for a session
@@ -123,13 +129,21 @@ func UnregisterImportTracker(sessionID string) {
 	globalTrackersMu.Lock()
 	defer globalTrackersMu.Unlock()
 	delete(globalTrackers, sessionID)
+	bklog.G(context.TODO()).Debugf("[cache mount] unregistered import tracker for session %s", sessionID)
 }
 
 // GetImportTracker retrieves the import tracker for a session
 func GetImportTracker(sessionID string) *ImportTracker {
 	globalTrackersMu.RLock()
 	defer globalTrackersMu.RUnlock()
-	return globalTrackers[sessionID]
+	tracker := globalTrackers[sessionID]
+	// Log for debugging
+	var keys []string
+	for k := range globalTrackers {
+		keys = append(keys, k)
+	}
+	bklog.G(context.TODO()).Debugf("[cache mount] GetImportTracker(%s): found=%v, all sessions: %v", sessionID, tracker != nil, keys)
+	return tracker
 }
 
 // NewImportEntry creates a new ImportEntry

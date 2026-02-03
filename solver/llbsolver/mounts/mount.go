@@ -376,17 +376,34 @@ func (mm *MountManager) MountableCache(ctx context.Context, m *pb.Mount, ref cac
 
 	id := m.CacheOpt.ID
 
+	// Normalize ID for import tracker lookup - strip leading slash if present
+	// The import tracker uses the ID from --cache-mount-import (e.g., "bigcache")
+	// but CacheOpt.ID may have a leading slash (e.g., "/bigcache")
+	importID := strings.TrimPrefix(id, "/")
+
 	// Wait for any pending import of this cache mount to complete
 	// Look up the tracker using session ID from the group
 	sessionIDs := session.AllSessionIDs(g)
+	bklog.G(ctx).Debugf("[cache mount] MountableCache called for %s (import lookup: %s), session IDs: %v", id, importID, sessionIDs)
+
+	trackerFound := false
 	for _, sessionID := range sessionIDs {
 		tracker := cachemount.GetImportTracker(sessionID)
+		bklog.G(ctx).Debugf("[cache mount] looking up tracker for session %s: found=%v", sessionID, tracker != nil)
 		if tracker != nil {
-			if tracker.WaitForImport(ctx, id) {
-				bklog.G(ctx).Debugf("[cache mount] import of %s completed, proceeding with mount", id)
+			trackerFound = true
+			bklog.G(ctx).Infof("[cache mount] waiting for import of %s to complete...", importID)
+			if tracker.WaitForImport(ctx, importID) {
+				bklog.G(ctx).Infof("[cache mount] import of %s completed, proceeding with mount", importID)
+			} else {
+				bklog.G(ctx).Debugf("[cache mount] no pending import for %s or already completed", importID)
 			}
 			break
 		}
+	}
+
+	if !trackerFound {
+		bklog.G(ctx).Debugf("[cache mount] no import tracker found for any session, proceeding with mount for %s", id)
 	}
 
 	return mm.getRefCacheDir(ctx, ref, id, m, m.CacheOpt.Sharing, g)
