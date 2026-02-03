@@ -174,7 +174,6 @@ func (m *Manager) performImport(ctx context.Context, cm cache.Manager, entry *Im
 		importDone := progress.OneOff(ctx, fmt.Sprintf("[cache mount] importing %s from %s", entry.ID, ref))
 		startTime := time.Now()
 
-		// Log to help with debugging in daemonless mode
 		bklog.G(ctx).Infof("[cache mount] importing %s from %s", entry.ID, ref)
 
 		importerFunc := RegistryCacheMountImporterFunc(m.sm, m.cs, m.hosts)
@@ -255,6 +254,19 @@ func (m *Manager) RunExports(ctx context.Context, cm cache.Manager, g session.Gr
 
 // ErrCacheMountNotFound is returned when a cache mount doesn't exist and cannot be exported
 var ErrCacheMountNotFound = errors.New("cache mount not found")
+
+// ExportOne exports a single cache mount by ID
+func (m *Manager) ExportOne(ctx context.Context, cm cache.Manager, id string, g session.Group) (*ExportResult, error) {
+	m.exportsMu.Lock()
+	entry, ok := m.pendingExports[id]
+	m.exportsMu.Unlock()
+
+	if !ok {
+		return nil, errors.Errorf("no export configured for cache mount %s", id)
+	}
+
+	return m.performExport(ctx, cm, entry, g)
+}
 
 func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *ExportEntry, g session.Group) (*ExportResult, error) {
 	ref := entry.Attrs["ref"]

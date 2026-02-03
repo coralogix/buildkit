@@ -72,7 +72,7 @@ func (e *contentExporter) Export(ctx context.Context, id string, sourcePath stri
 		return nil, ErrCacheMountEmpty
 	}
 
-	// Create the layer (tar + gzip of the directory contents)
+	// Create the layer (tar archive of the directory contents)
 	layerDesc, originalSize, err := e.createLayer(ctx, id, sourcePath)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create cache mount layer")

@@ -1135,6 +1135,19 @@ func (s *Solver) Status(ctx context.Context, id string, statusChan chan *client.
 	return j.Status(ctx, statusChan)
 }
 
+// RunInJobContext executes a function within a job's progress context,
+// allowing progress messages to be sent to the client.
+// The name parameter is displayed as the vertex name in the progress output.
+func (s *Solver) RunInJobContext(ctx context.Context, jobID string, name string, f func(ctx context.Context) error) error {
+	j, err := s.solver.Get(jobID)
+	if err != nil {
+		return err
+	}
+	return inBuilderContext(ctx, j, name, "", func(ctx context.Context, _ solver.JobContext) error {
+		return f(ctx)
+	})
+}
+
 func defaultResolver(wc *worker.Controller) ResolveWorkerFunc {
 	return func() (worker.Worker, error) {
 		return wc.GetDefault()

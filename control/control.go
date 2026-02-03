@@ -417,7 +417,7 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 		}
 
 		// Start cache mount imports in background goroutine
-		// This runs concurrently with solve setup and will complete before or during solve
+		// This runs concurrently with solve and uses RunInJobContext for progress visibility
 		if len(req.Cache.CacheMountImports) > 0 {
 			importWg.Add(1)
 			go func() {
@@ -428,9 +428,7 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 					}
 				}()
 
-				// Wait for session with a short timeout - if session isn't ready quickly,
-				// the import will likely fail anyway
-				// Use ctx to preserve progress writer for visible progress messages
+				// Wait for session with a short timeout
 				sessionCtx, sessionCancel := context.WithTimeout(ctx, 30*time.Second)
 				_, err := c.opt.SessionManager.Get(sessionCtx, req.Session, false)
 				sessionCancel()
@@ -441,15 +439,34 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 
 				g := session.NewGroup(req.Session)
 				for _, imp := range req.Cache.CacheMountImports {
-					// Use ctx to preserve progress writer for visible progress messages
-					impCtx, impCancel := context.WithTimeout(ctx, 120*time.Second)
-					bklog.G(ctx).Debugf("attempting to import cache mount %s", imp.ID)
-					if imported, err := cacheMountManager.TryImport(impCtx, cm, imp.ID, g); err != nil {
-						bklog.G(ctx).WithError(err).Debugf("failed to import cache mount %s (this is normal for first build)", imp.ID)
-					} else if imported {
-						bklog.G(ctx).Debugf("imported cache mount %s", imp.ID)
+					impID := imp.ID
+					ref := imp.Attrs["ref"]
+
+					// Use RunInJobContext to show progress in client output
+					importErr := c.solver.RunInJobContext(ctx, req.Ref, fmt.Sprintf("[cache mount] importing %s", impID), func(progressCtx context.Context) error {
+						impCtx, impCancel := context.WithTimeout(progressCtx, 120*time.Second)
+						defer impCancel()
+
+						if imported, err := cacheMountManager.TryImport(impCtx, cm, impID, g); err != nil {
+							bklog.G(ctx).WithError(err).Debugf("failed to import cache mount %s (this is normal for first build)", impID)
+							// Return nil to not show error in progress - this is expected for first builds
+							return nil
+						} else if imported {
+							bklog.G(ctx).Debugf("imported cache mount %s from %s", impID, ref)
+						}
+						return nil
+					})
+					if importErr != nil {
+						// Job not ready yet - fall back to non-progress import
+						bklog.G(ctx).WithError(importErr).Debugf("falling back to non-progress import for %s", impID)
+						impCtx, impCancel := context.WithTimeout(ctx, 120*time.Second)
+						if imported, err := cacheMountManager.TryImport(impCtx, cm, impID, g); err != nil {
+							bklog.G(ctx).WithError(err).Debugf("failed to import cache mount %s", impID)
+						} else if imported {
+							bklog.G(ctx).Debugf("imported cache mount %s", impID)
+						}
+						impCancel()
 					}
-					impCancel()
 				}
 			}()
 		}
@@ -474,13 +491,25 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 			if len(req.Cache.CacheMountExports) > 0 {
 				g := session.NewGroup(req.Session)
 				bklog.G(ctx).Debugf("running cache mount exports for %d entries", len(req.Cache.CacheMountExports))
-				results, err := cacheMountManager.RunExports(ctx, cm, g)
-				if err != nil {
-					bklog.G(ctx).WithError(err).Warn("failed to run cache mount exports")
-				}
-				for id, result := range results {
-					if result != nil {
-						bklog.G(ctx).Infof("exported cache mount %s to %s (digest: %s)", id, result.Ref, result.Digest)
+
+				for _, exp := range req.Cache.CacheMountExports {
+					expID := exp.ID
+					ref := exp.Attrs["ref"]
+
+					// Use RunInJobContext to show progress in client output
+					exportErr := c.solver.RunInJobContext(ctx, req.Ref, fmt.Sprintf("[cache mount] exporting %s", expID), func(progressCtx context.Context) error {
+						result, err := cacheMountManager.ExportOne(progressCtx, cm, expID, g)
+						if err != nil {
+							bklog.G(ctx).WithError(err).Warnf("failed to export cache mount %s", expID)
+							return nil // Don't fail the build for export errors
+						}
+						if result != nil {
+							bklog.G(ctx).Infof("exported cache mount %s to %s (digest: %s)", expID, ref, result.Digest)
+						}
+						return nil
+					})
+					if exportErr != nil {
+						bklog.G(ctx).WithError(exportErr).Warnf("failed to run export in job context for %s", expID)
 					}
 				}
 			}

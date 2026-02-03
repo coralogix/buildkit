@@ -2,7 +2,6 @@ package cachemount
 
 import (
 	"archive/tar"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/containerd/containerd/v2/core/content"
-	"github.com/containerd/containerd/v2/core/images"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/progress"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -118,33 +116,10 @@ func (i *contentImporter) extractLayer(ctx context.Context, id string, desc ocis
 	}
 	defer ra.Close()
 
-	// Determine if the layer is compressed
-	var reader io.Reader = content.NewReader(ra)
+	// Cache mount layers are always uncompressed tar
+	reader := content.NewReader(ra)
 
-	switch desc.MediaType {
-	case ocispecs.MediaTypeImageLayerGzip, images.MediaTypeDockerSchema2LayerGzip:
-		gr, err := gzip.NewReader(reader)
-		if err != nil {
-			extractDone(err)
-			return errors.Wrap(err, "failed to create gzip reader")
-		}
-		defer gr.Close()
-		reader = gr
-	case ocispecs.MediaTypeImageLayer, images.MediaTypeDockerSchema2Layer:
-		// Uncompressed, use as-is
-	default:
-		bklog.G(ctx).Warnf("unknown layer media type %s, attempting gzip decompression", desc.MediaType)
-		gr, err := gzip.NewReader(reader)
-		if err != nil {
-			// Fall back to uncompressed
-			ra2, _ := i.provider.ReaderAt(ctx, desc)
-			defer ra2.Close()
-			reader = content.NewReader(ra2)
-		} else {
-			defer gr.Close()
-			reader = gr
-		}
-	}
+	bklog.G(ctx).Debugf("[cache mount] extracting layer with media type %s", desc.MediaType)
 
 	// Extract tar archive
 	tr := tar.NewReader(reader)
