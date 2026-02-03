@@ -3,7 +3,6 @@ package cachemount
 import (
 	"archive/tar"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -45,6 +44,9 @@ func (e *contentExporter) Name() string {
 	return fmt.Sprintf("exporting cache mount to %s", e.ref)
 }
 
+// ErrCacheMountEmpty is returned when a cache mount directory is empty
+var ErrCacheMountEmpty = errors.New("cache mount is empty")
+
 func (e *contentExporter) Export(ctx context.Context, id string, sourcePath string) (*ocispecs.Descriptor, error) {
 	bklog.G(ctx).Debugf("exporting cache mount %s from %s", id, sourcePath)
 
@@ -58,6 +60,16 @@ func (e *contentExporter) Export(ctx context.Context, id string, sourcePath stri
 	}
 	if !info.IsDir() {
 		return nil, errors.Errorf("cache mount source %s is not a directory", sourcePath)
+	}
+
+	// Check if directory is empty
+	empty, err := isDirEmpty(sourcePath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to check if cache mount %s is empty", sourcePath)
+	}
+	if empty {
+		bklog.G(ctx).Debugf("cache mount %s is empty, skipping export", id)
+		return nil, ErrCacheMountEmpty
 	}
 
 	// Create the layer (tar + gzip of the directory contents)
@@ -97,8 +109,8 @@ func (e *contentExporter) Export(ctx context.Context, id string, sourcePath stri
 func (e *contentExporter) createLayer(ctx context.Context, id string, sourcePath string) (ocispecs.Descriptor, int64, error) {
 	layerDone := progress.OneOff(ctx, fmt.Sprintf("creating cache mount layer for %s", id))
 
-	// Create a temp file to stream the compressed tar to avoid memory issues with large caches
-	tmpFile, err := os.CreateTemp("", "cachemount-layer-*.tar.gz")
+	// Create a temp file to stream the tar to avoid memory issues with large caches
+	tmpFile, err := os.CreateTemp("", "cachemount-layer-*.tar")
 	if err != nil {
 		layerDone(err)
 		return ocispecs.Descriptor{}, 0, errors.Wrap(err, "failed to create temp file for layer")
@@ -110,8 +122,7 @@ func (e *contentExporter) createLayer(ctx context.Context, id string, sourcePath
 	digester := digest.Canonical.Digester()
 	multiWriter := io.MultiWriter(tmpFile, digester.Hash())
 
-	gw := gzip.NewWriter(multiWriter)
-	tw := tar.NewWriter(gw)
+	tw := tar.NewWriter(multiWriter)
 
 	var originalSize int64
 
@@ -172,22 +183,15 @@ func (e *contentExporter) createLayer(ctx context.Context, id string, sourcePath
 
 	if err != nil {
 		tw.Close()
-		gw.Close()
 		tmpFile.Close()
 		layerDone(err)
 		return ocispecs.Descriptor{}, 0, errors.Wrap(err, "failed to create tar archive")
 	}
 
 	if err := tw.Close(); err != nil {
-		gw.Close()
 		tmpFile.Close()
 		layerDone(err)
 		return ocispecs.Descriptor{}, 0, errors.Wrap(err, "failed to close tar writer")
-	}
-	if err := gw.Close(); err != nil {
-		tmpFile.Close()
-		layerDone(err)
-		return ocispecs.Descriptor{}, 0, errors.Wrap(err, "failed to close gzip writer")
 	}
 
 	// Get the file size and digest
@@ -210,7 +214,7 @@ func (e *contentExporter) createLayer(ctx context.Context, id string, sourcePath
 	defer tmpFile.Close()
 
 	desc := ocispecs.Descriptor{
-		MediaType: ocispecs.MediaTypeImageLayerGzip,
+		MediaType: ocispecs.MediaTypeImageLayer,
 		Digest:    dgst,
 		Size:      layerSize,
 		Annotations: map[string]string{
@@ -301,4 +305,20 @@ func (e *contentExporter) Finalize(ctx context.Context) (map[string]string, erro
 	}
 
 	return res, nil
+}
+
+// isDirEmpty checks if a directory is empty (no files or subdirectories)
+func isDirEmpty(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	// Read just one entry - if we get io.EOF, the directory is empty
+	_, err = f.Readdirnames(1)
+	if err == io.EOF {
+		return true, nil
+	}
+	return false, err
 }

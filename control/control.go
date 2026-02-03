@@ -395,6 +395,7 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 
 	// Handle cache mount imports/exports if specified
 	var importWg sync.WaitGroup
+	var buildSucceeded bool // Track whether build succeeded for conditional export
 	if len(req.Cache.CacheMountImports) > 0 || len(req.Cache.CacheMountExports) > 0 {
 		w, err := c.opt.WorkerController.GetDefault()
 		if err != nil {
@@ -451,7 +452,7 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 			}()
 		}
 
-		// Defer exports until after the solve completes
+		// Defer exports until after the solve completes (only if build succeeded)
 		defer func() {
 			// Wait for any in-progress imports to complete before exporting
 			importWg.Wait()
@@ -461,6 +462,12 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 					bklog.G(ctx).Errorf("panic during cache mount export: %v", r)
 				}
 			}()
+
+			// Only export if build succeeded
+			if !buildSucceeded {
+				bklog.G(ctx).Debug("skipping cache mount exports because build failed")
+				return
+			}
 
 			if len(req.Cache.CacheMountExports) > 0 {
 				g := session.NewGroup(req.Session)
@@ -635,6 +642,8 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 	if err != nil {
 		return nil, err
 	}
+	// Mark build as succeeded so cache mount exports will run
+	buildSucceeded = true
 	return &controlapi.SolveResponse{
 		ExporterResponse: resp.ExporterResponse,
 	}, nil

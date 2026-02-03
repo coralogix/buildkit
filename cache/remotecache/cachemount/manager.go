@@ -289,6 +289,12 @@ func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *Ex
 		// Perform the export
 		desc, err := exporter.Export(ctx, entry.ID, sourcePath)
 		if err != nil {
+			// Handle empty cache mount gracefully
+			if errors.Is(err, ErrCacheMountEmpty) {
+				exportDone(nil)
+				bklog.G(ctx).Infof("skipping export of cache mount %s: directory is empty", entry.ID)
+				return nil, nil
+			}
 			exportDone(err)
 			return nil, errors.Wrapf(err, "failed to export cache mount %s", entry.ID)
 		}
