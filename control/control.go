@@ -430,7 +430,8 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 
 				// Wait for session with a short timeout - if session isn't ready quickly,
 				// the import will likely fail anyway
-				sessionCtx, sessionCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				// Use ctx to preserve progress writer for visible progress messages
+				sessionCtx, sessionCancel := context.WithTimeout(ctx, 30*time.Second)
 				_, err := c.opt.SessionManager.Get(sessionCtx, req.Session, false)
 				sessionCancel()
 				if err != nil {
@@ -440,7 +441,8 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 
 				g := session.NewGroup(req.Session)
 				for _, imp := range req.Cache.CacheMountImports {
-					impCtx, impCancel := context.WithTimeout(context.Background(), 120*time.Second)
+					// Use ctx to preserve progress writer for visible progress messages
+					impCtx, impCancel := context.WithTimeout(ctx, 120*time.Second)
 					bklog.G(ctx).Debugf("attempting to import cache mount %s", imp.ID)
 					if imported, err := cacheMountManager.TryImport(impCtx, cm, imp.ID, g); err != nil {
 						bklog.G(ctx).WithError(err).Debugf("failed to import cache mount %s (this is normal for first build)", imp.ID)

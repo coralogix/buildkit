@@ -174,13 +174,16 @@ func (m *Manager) performImport(ctx context.Context, cm cache.Manager, entry *Im
 		importDone := progress.OneOff(ctx, fmt.Sprintf("[cache mount] importing %s from %s", entry.ID, ref))
 		startTime := time.Now()
 
+		// Log to help with debugging in daemonless mode
+		bklog.G(ctx).Infof("[cache mount] importing %s from %s", entry.ID, ref)
+
 		importerFunc := RegistryCacheMountImporterFunc(m.sm, m.cs, m.hosts)
 		importer, _, err := importerFunc(ctx, g, entry.Attrs)
 		if err != nil {
 			// If the cache doesn't exist in the registry, that's expected for first-time builds
 			if errors.Is(err, ErrCacheNotFound) {
 				importDone(nil) // Mark as done without error
-				bklog.G(ctx).Debugf("cache mount %s not found in registry (first build?), skipping import", entry.ID)
+				bklog.G(ctx).Infof("[cache mount] %s not found in registry (first build?), skipping import", entry.ID)
 				return nil
 			}
 			importDone(err)
@@ -203,7 +206,7 @@ func (m *Manager) performImport(ctx context.Context, cm cache.Manager, entry *Im
 
 		elapsed := time.Since(startTime)
 		importDone(nil)
-		bklog.G(ctx).Infof("successfully imported cache mount %s from registry in %s", entry.ID, elapsed.Round(time.Millisecond))
+		bklog.G(ctx).Infof("[cache mount] successfully imported %s in %s", entry.ID, elapsed.Round(time.Millisecond))
 		return nil
 	default:
 		return errors.Errorf("unsupported cache mount import type: %s", entry.Type)
@@ -255,21 +258,18 @@ var ErrCacheMountNotFound = errors.New("cache mount not found")
 
 func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *ExportEntry, g session.Group) (*ExportResult, error) {
 	ref := entry.Attrs["ref"]
-	bklog.G(ctx).Infof("performing export for cache mount %s (type=%s)", entry.ID, entry.Type)
 
 	switch entry.Type {
 	case "registry":
-		bklog.G(ctx).Debugf("looking for cache mount %s to export", entry.ID)
 		// Get the cache mount path (createIfMissing=false to avoid exporting empty caches)
 		sourcePath, cleanup, err := m.getCacheMountPath(ctx, cm, entry.ID, g, false)
 		if err != nil {
 			if errors.Is(err, ErrCacheMountNotFound) {
 				skipDone := progress.OneOff(ctx, fmt.Sprintf("[cache mount] skipping %s: not found", entry.ID))
 				skipDone(nil)
-				bklog.G(ctx).Warnf("skipping export of cache mount %s: %v", entry.ID, err)
+				bklog.G(ctx).Infof("[cache mount] skipping export of %s: cache mount not used", entry.ID)
 				return nil, nil
 			}
-			bklog.G(ctx).WithError(err).Errorf("failed to get cache mount path for export: %s", entry.ID)
 			return nil, errors.Wrapf(err, "failed to get cache mount path for export: %s", entry.ID)
 		}
 		defer cleanup()
@@ -277,7 +277,7 @@ func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *Ex
 		exportDone := progress.OneOff(ctx, fmt.Sprintf("[cache mount] exporting %s to %s", entry.ID, ref))
 		startTime := time.Now()
 
-		bklog.G(ctx).Infof("found cache mount %s at %s, starting export", entry.ID, sourcePath)
+		bklog.G(ctx).Infof("[cache mount] exporting %s to %s", entry.ID, ref)
 
 		exporterFunc := RegistryCacheMountExporterFunc(m.sm, m.hosts)
 		exporter, err := exporterFunc(ctx, g, entry.Attrs)
@@ -292,7 +292,7 @@ func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *Ex
 			// Handle empty cache mount gracefully
 			if errors.Is(err, ErrCacheMountEmpty) {
 				exportDone(nil)
-				bklog.G(ctx).Infof("skipping export of cache mount %s: directory is empty", entry.ID)
+				bklog.G(ctx).Infof("[cache mount] skipping export of %s: directory is empty", entry.ID)
 				return nil, nil
 			}
 			exportDone(err)
@@ -306,7 +306,7 @@ func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *Ex
 
 		elapsed := time.Since(startTime)
 		exportDone(nil)
-		bklog.G(ctx).Infof("successfully exported cache mount %s to %s in %s", entry.ID, ref, elapsed.Round(time.Millisecond))
+		bklog.G(ctx).Infof("[cache mount] successfully exported %s to %s in %s", entry.ID, ref, elapsed.Round(time.Millisecond))
 		return &ExportResult{
 			ID:     entry.ID,
 			Ref:    ref,
