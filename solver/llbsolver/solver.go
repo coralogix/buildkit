@@ -65,7 +65,8 @@ type ExporterRequest struct {
 
 // PreSolveFunc is called after the job is created but before the build starts.
 // It receives a context with progress writer attached, allowing progress to be shown.
-type PreSolveFunc func(ctx context.Context, j *solver.Job) error
+// It can return a modified context that will be used for the build.
+type PreSolveFunc func(ctx context.Context, j *solver.Job) (context.Context, error)
 
 type RemoteCacheExporter struct {
 	remotecache.Exporter
@@ -572,8 +573,14 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 
 	// Run pre-solve hook if provided (e.g., for cache mount imports)
 	if preSolve != nil {
-		if err := j.InContext(ctx, func(ctx context.Context, _ solver.JobContext) error {
-			return preSolve(ctx, j)
+		var preSolveErr error
+		if err := j.InContext(ctx, func(progressCtx context.Context, _ solver.JobContext) error {
+			var newCtx context.Context
+			newCtx, preSolveErr = preSolve(progressCtx, j)
+			if preSolveErr == nil && newCtx != nil {
+				ctx = newCtx
+			}
+			return preSolveErr
 		}); err != nil {
 			return nil, errors.Wrap(err, "pre-solve hook failed")
 		}

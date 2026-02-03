@@ -44,6 +44,29 @@ type MountManager struct {
 	managerName   string
 }
 
+// CacheMountImportTracker is an interface for tracking cache mount imports
+type CacheMountImportTracker interface {
+	WaitForImport(ctx context.Context, id string) bool
+}
+
+// importTrackerKey is the context key for the cache mount import tracker
+type importTrackerKey struct{}
+
+// ContextWithImportTracker returns a context with the import tracker attached
+func ContextWithImportTracker(ctx context.Context, tracker CacheMountImportTracker) context.Context {
+	return context.WithValue(ctx, importTrackerKey{}, tracker)
+}
+
+// getImportTrackerFromContext retrieves the import tracker from context
+func getImportTrackerFromContext(ctx context.Context) CacheMountImportTracker {
+	if v := ctx.Value(importTrackerKey{}); v != nil {
+		if tracker, ok := v.(CacheMountImportTracker); ok {
+			return tracker
+		}
+	}
+	return nil
+}
+
 func (mm *MountManager) getRefCacheDir(ctx context.Context, ref cache.ImmutableRef, id string, m *pb.Mount, sharing pb.CacheSharingOpt, s session.Group) (mref cache.MutableRef, err error) {
 	name := fmt.Sprintf("cached mount %s from %s", m.Dest, mm.managerName)
 	if id != m.Dest {
@@ -371,7 +394,17 @@ func (mm *MountManager) MountableCache(ctx context.Context, m *pb.Mount, ref cac
 	if m.CacheOpt == nil {
 		return nil, errors.Errorf("missing cache mount options")
 	}
-	return mm.getRefCacheDir(ctx, ref, m.CacheOpt.ID, m, m.CacheOpt.Sharing, g)
+
+	id := m.CacheOpt.ID
+
+	// Wait for any pending import of this cache mount to complete
+	if tracker := getImportTrackerFromContext(ctx); tracker != nil {
+		if tracker.WaitForImport(ctx, id) {
+			bklog.G(ctx).Debugf("cache mount %s import completed, proceeding with mount", id)
+		}
+	}
+
+	return mm.getRefCacheDir(ctx, ref, id, m, m.CacheOpt.Sharing, g)
 }
 
 func (mm *MountManager) MountableTmpFS(m *pb.Mount) cache.Mountable {

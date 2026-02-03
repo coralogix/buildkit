@@ -37,6 +37,7 @@ import (
 	"github.com/moby/buildkit/solver/bboltcachestorage"
 	"github.com/moby/buildkit/solver/llbsolver"
 	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
+	"github.com/moby/buildkit/solver/llbsolver/mounts"
 	"github.com/moby/buildkit/solver/llbsolver/proc"
 	provenancetypes "github.com/moby/buildkit/solver/llbsolver/provenance/types"
 	"github.com/moby/buildkit/solver/pb"
@@ -399,6 +400,7 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 	var preSolve llbsolver.PreSolveFunc
 	var cacheMountManager *cachemount.Manager
 	var cacheMgr cache.Manager
+	var importTracker *cachemount.ImportTracker
 
 	if len(req.Cache.CacheMountImports) > 0 || len(req.Cache.CacheMountExports) > 0 {
 		w, err := c.opt.WorkerController.GetDefault()
@@ -420,33 +422,49 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 			cacheMountManager.AddExport(cachemount.NewExportEntry(exp.ID, exp.Type, exp.Attrs))
 		}
 
-		// Create pre-solve hook for cache mount imports
-		// This runs BEFORE the build starts, ensuring imports complete first
+		// Create import tracker for lazy waiting
+		// Imports run in background and only block when the specific cache mount is accessed
 		if len(req.Cache.CacheMountImports) > 0 {
-			preSolve = func(progressCtx context.Context, j *solver.Job) error {
+			importTracker = cachemount.NewImportTracker()
+
+			preSolve = func(progressCtx context.Context, j *solver.Job) (context.Context, error) {
 				g := session.NewGroup(req.Session)
+
+				// Start all imports in background goroutines
 				for _, imp := range req.Cache.CacheMountImports {
 					impID := imp.ID
 					ref := imp.Attrs["ref"]
 
-					// Use InBuilderContext to show progress vertex
-					if err := llbsolver.InBuilderContext(progressCtx, j, fmt.Sprintf("[cache mount] importing %s", impID), "", func(ctx context.Context, _ solver.JobContext) error {
-						impCtx, impCancel := context.WithTimeout(ctx, 120*time.Second)
-						defer impCancel()
+					// Register pending import and get completion callback
+					importDone := importTracker.StartImport(impID)
 
-						if imported, err := cacheMountManager.TryImport(impCtx, cacheMgr, impID, g); err != nil {
-							bklog.G(ctx).WithError(err).Debugf("failed to import cache mount %s (this is normal for first build)", impID)
-							// Return nil to not show error in progress - this is expected for first builds
+					// Start import in background goroutine
+					go func(impID, ref string, importDone func(bool)) {
+						// Use InBuilderContext to show progress vertex
+						err := llbsolver.InBuilderContext(progressCtx, j, fmt.Sprintf("[cache mount] importing %s", impID), "", func(ctx context.Context, _ solver.JobContext) error {
+							impCtx, impCancel := context.WithTimeout(ctx, 120*time.Second)
+							defer impCancel()
+
+							if imported, err := cacheMountManager.TryImport(impCtx, cacheMgr, impID, g); err != nil {
+								bklog.G(ctx).WithError(err).Debugf("failed to import cache mount %s (this is normal for first build)", impID)
+								return nil
+							} else if imported {
+								bklog.G(ctx).Debugf("imported cache mount %s from %s", impID, ref)
+							}
 							return nil
-						} else if imported {
-							bklog.G(ctx).Debugf("imported cache mount %s from %s", impID, ref)
+						})
+						if err != nil {
+							bklog.G(progressCtx).WithError(err).Warnf("error importing cache mount %s", impID)
+							importDone(false)
+						} else {
+							importDone(true)
 						}
-						return nil
-					}); err != nil {
-						bklog.G(progressCtx).WithError(err).Warnf("error importing cache mount %s", impID)
-					}
+					}(impID, ref, importDone)
 				}
-				return nil
+
+				// Return context with import tracker attached
+				// This allows MountableCache to wait for specific imports
+				return mounts.ContextWithImportTracker(ctx, importTracker), nil
 			}
 		}
 

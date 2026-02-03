@@ -38,6 +38,69 @@ type ExportResult struct {
 	Digest string
 }
 
+// ImportTracker tracks pending cache mount imports and allows waiting for specific imports
+type ImportTracker struct {
+	mu       sync.Mutex
+	pending  map[string]chan struct{} // cacheID -> done channel
+	imported map[string]bool          // cacheID -> success
+}
+
+// NewImportTracker creates a new import tracker
+func NewImportTracker() *ImportTracker {
+	return &ImportTracker{
+		pending:  make(map[string]chan struct{}),
+		imported: make(map[string]bool),
+	}
+}
+
+// StartImport registers a pending import for the given cache ID
+// Returns a function to call when the import completes
+func (t *ImportTracker) StartImport(id string) func(success bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	ch := make(chan struct{})
+	t.pending[id] = ch
+
+	return func(success bool) {
+		t.mu.Lock()
+		t.imported[id] = success
+		delete(t.pending, id)
+		t.mu.Unlock()
+		close(ch)
+	}
+}
+
+// WaitForImport waits for the import of the given cache ID to complete
+// Returns true if an import was pending and completed, false if no import was pending
+func (t *ImportTracker) WaitForImport(ctx context.Context, id string) bool {
+	t.mu.Lock()
+	ch, pending := t.pending[id]
+	if !pending {
+		// Check if already imported
+		imported := t.imported[id]
+		t.mu.Unlock()
+		return imported
+	}
+	t.mu.Unlock()
+
+	// Wait for import to complete
+	select {
+	case <-ch:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// IsImportPending returns true if there's a pending import for the given ID
+func (t *ImportTracker) IsImportPending(id string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, pending := t.pending[id]
+	return pending
+}
+
 // NewImportEntry creates a new ImportEntry
 func NewImportEntry(id, typ string, attrs map[string]string) *ImportEntry {
 	return &ImportEntry{
