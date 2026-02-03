@@ -37,7 +37,6 @@ import (
 	"github.com/moby/buildkit/solver/bboltcachestorage"
 	"github.com/moby/buildkit/solver/llbsolver"
 	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
-	"github.com/moby/buildkit/solver/llbsolver/mounts"
 	"github.com/moby/buildkit/solver/llbsolver/proc"
 	provenancetypes "github.com/moby/buildkit/solver/llbsolver/provenance/types"
 	"github.com/moby/buildkit/solver/pb"
@@ -427,6 +426,9 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 		if len(req.Cache.CacheMountImports) > 0 {
 			importTracker = cachemount.NewImportTracker()
 
+			// Register tracker globally with session ID so MountableCache can find it
+			cachemount.RegisterImportTracker(req.Session, importTracker)
+
 			preSolve = func(progressCtx context.Context, j *solver.Job) (context.Context, error) {
 				g := session.NewGroup(req.Session)
 
@@ -449,12 +451,12 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 								bklog.G(ctx).WithError(err).Debugf("failed to import cache mount %s (this is normal for first build)", impID)
 								return nil
 							} else if imported {
-								bklog.G(ctx).Debugf("imported cache mount %s from %s", impID, ref)
+								bklog.G(ctx).Debugf("[cache mount] imported %s from %s", impID, ref)
 							}
 							return nil
 						})
 						if err != nil {
-							bklog.G(progressCtx).WithError(err).Warnf("error importing cache mount %s", impID)
+							bklog.G(progressCtx).WithError(err).Warnf("[cache mount] error importing %s", impID)
 							importDone(false)
 						} else {
 							importDone(true)
@@ -462,19 +464,22 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 					}(impID, ref, importDone)
 				}
 
-				// Return context with import tracker attached
-				// This allows MountableCache to wait for specific imports
-				return mounts.ContextWithImportTracker(ctx, importTracker), nil
+				return ctx, nil
 			}
 		}
 
-		// Defer exports until after the solve completes (only if build succeeded)
+		// Defer cleanup and exports until after the solve completes
 		defer func() {
 			defer func() {
 				if r := recover(); r != nil {
 					bklog.G(ctx).Errorf("panic during cache mount export: %v", r)
 				}
 			}()
+
+			// Always unregister the import tracker when done
+			if importTracker != nil {
+				cachemount.UnregisterImportTracker(req.Session)
+			}
 
 			// Only export if build succeeded
 			if !buildSucceeded {
@@ -484,7 +489,7 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 
 			if len(req.Cache.CacheMountExports) > 0 {
 				g := session.NewGroup(req.Session)
-				bklog.G(ctx).Debugf("running cache mount exports for %d entries", len(req.Cache.CacheMountExports))
+				bklog.G(ctx).Debugf("[cache mount] running exports for %d entries", len(req.Cache.CacheMountExports))
 
 				for _, exp := range req.Cache.CacheMountExports {
 					expID := exp.ID
@@ -494,16 +499,16 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 					exportErr := c.solver.RunInJobContext(ctx, req.Ref, fmt.Sprintf("[cache mount] exporting %s", expID), func(progressCtx context.Context) error {
 						result, err := cacheMountManager.ExportOne(progressCtx, cacheMgr, expID, g)
 						if err != nil {
-							bklog.G(ctx).WithError(err).Warnf("failed to export cache mount %s", expID)
+							bklog.G(ctx).WithError(err).Warnf("[cache mount] failed to export %s", expID)
 							return nil // Don't fail the build for export errors
 						}
 						if result != nil {
-							bklog.G(ctx).Infof("exported cache mount %s to %s (digest: %s)", expID, ref, result.Digest)
+							bklog.G(ctx).Infof("[cache mount] exported %s to %s (digest: %s)", expID, ref, result.Digest)
 						}
 						return nil
 					})
 					if exportErr != nil {
-						bklog.G(ctx).WithError(exportErr).Warnf("failed to run export in job context for %s", expID)
+						bklog.G(ctx).WithError(exportErr).Warnf("[cache mount] failed to run export in job context for %s", expID)
 					}
 				}
 			}

@@ -12,7 +12,6 @@ import (
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/moby/buildkit/util/bklog"
-	"github.com/moby/buildkit/util/progress"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
@@ -75,18 +74,14 @@ func (i *contentImporter) Import(ctx context.Context, id string, destPath string
 }
 
 func (i *contentImporter) fetchManifest(ctx context.Context) (*ocispecs.Manifest, error) {
-	fetchDone := progress.OneOff(ctx, "fetching cache mount manifest")
-
 	ra, err := i.provider.ReaderAt(ctx, i.desc)
 	if err != nil {
-		fetchDone(err)
 		return nil, errors.Wrap(err, "failed to get manifest reader")
 	}
 	defer ra.Close()
 
 	data := make([]byte, i.desc.Size)
 	if _, err := ra.ReadAt(data, 0); err != nil {
-		fetchDone(err)
 		return nil, errors.Wrap(err, "failed to read manifest")
 	}
 
@@ -95,23 +90,17 @@ func (i *contentImporter) fetchManifest(ctx context.Context) (*ocispecs.Manifest
 		// Try parsing as index first (in case it's a manifest list)
 		var index ocispecs.Index
 		if err2 := json.Unmarshal(data, &index); err2 == nil {
-			fetchDone(errors.New("manifest list not supported for cache mount import"))
 			return nil, errors.New("cache mount import requires a single manifest, not a manifest list")
 		}
-		fetchDone(err)
 		return nil, errors.Wrap(err, "failed to parse manifest")
 	}
 
-	fetchDone(nil)
 	return &manifest, nil
 }
 
 func (i *contentImporter) extractLayer(ctx context.Context, id string, desc ocispecs.Descriptor, destPath string, idx int) error {
-	extractDone := progress.OneOff(ctx, fmt.Sprintf("extracting cache mount layer %d for %s", idx, id))
-
 	ra, err := i.provider.ReaderAt(ctx, desc)
 	if err != nil {
-		extractDone(err)
 		return errors.Wrap(err, "failed to get layer reader")
 	}
 	defer ra.Close()
@@ -119,7 +108,7 @@ func (i *contentImporter) extractLayer(ctx context.Context, id string, desc ocis
 	// Cache mount layers are always uncompressed tar
 	reader := content.NewReader(ra)
 
-	bklog.G(ctx).Debugf("[cache mount] extracting layer with media type %s", desc.MediaType)
+	bklog.G(ctx).Debugf("[cache mount] extracting layer %d with media type %s", idx, desc.MediaType)
 
 	// Extract tar archive
 	tr := tar.NewReader(reader)
@@ -129,40 +118,35 @@ func (i *contentImporter) extractLayer(ctx context.Context, id string, desc ocis
 			break
 		}
 		if err != nil {
-			extractDone(err)
 			return errors.Wrap(err, "failed to read tar header")
 		}
 
 		// Sanitize the path to prevent directory traversal
 		targetPath := filepath.Join(destPath, filepath.Clean(header.Name))
 		if !isSubPath(destPath, targetPath) {
-			bklog.G(ctx).Warnf("skipping potentially unsafe path: %s", header.Name)
+			bklog.G(ctx).Warnf("[cache mount] skipping potentially unsafe path: %s", header.Name)
 			continue
 		}
 
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(targetPath, os.FileMode(header.Mode)); err != nil {
-				extractDone(err)
 				return errors.Wrapf(err, "failed to create directory %s", targetPath)
 			}
 
 		case tar.TypeReg:
 			// Ensure parent directory exists
 			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-				extractDone(err)
 				return errors.Wrapf(err, "failed to create parent directory for %s", targetPath)
 			}
 
 			f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
 			if err != nil {
-				extractDone(err)
 				return errors.Wrapf(err, "failed to create file %s", targetPath)
 			}
 
 			if _, err := io.Copy(f, tr); err != nil {
 				f.Close()
-				extractDone(err)
 				return errors.Wrapf(err, "failed to write file %s", targetPath)
 			}
 			f.Close()
@@ -170,7 +154,6 @@ func (i *contentImporter) extractLayer(ctx context.Context, id string, desc ocis
 		case tar.TypeSymlink:
 			// Ensure parent directory exists
 			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-				extractDone(err)
 				return errors.Wrapf(err, "failed to create parent directory for symlink %s", targetPath)
 			}
 
@@ -178,20 +161,18 @@ func (i *contentImporter) extractLayer(ctx context.Context, id string, desc ocis
 			os.Remove(targetPath)
 
 			if err := os.Symlink(header.Linkname, targetPath); err != nil {
-				extractDone(err)
 				return errors.Wrapf(err, "failed to create symlink %s", targetPath)
 			}
 
 		case tar.TypeLink:
 			// Ensure parent directory exists
 			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-				extractDone(err)
 				return errors.Wrapf(err, "failed to create parent directory for hard link %s", targetPath)
 			}
 
 			linkTarget := filepath.Join(destPath, filepath.Clean(header.Linkname))
 			if !isSubPath(destPath, linkTarget) {
-				bklog.G(ctx).Warnf("skipping potentially unsafe hard link target: %s", header.Linkname)
+				bklog.G(ctx).Warnf("[cache mount] skipping potentially unsafe hard link target: %s", header.Linkname)
 				continue
 			}
 
@@ -199,22 +180,20 @@ func (i *contentImporter) extractLayer(ctx context.Context, id string, desc ocis
 			os.Remove(targetPath)
 
 			if err := os.Link(linkTarget, targetPath); err != nil {
-				extractDone(err)
 				return errors.Wrapf(err, "failed to create hard link %s", targetPath)
 			}
 
 		default:
-			bklog.G(ctx).Debugf("skipping unsupported tar entry type %d for %s", header.Typeflag, header.Name)
+			bklog.G(ctx).Debugf("[cache mount] skipping unsupported tar entry type %d for %s", header.Typeflag, header.Name)
 		}
 
 		// Set modification time
 		if err := os.Chtimes(targetPath, header.AccessTime, header.ModTime); err != nil {
 			// Non-fatal, just log
-			bklog.G(ctx).Debugf("failed to set times for %s: %v", targetPath, err)
+			bklog.G(ctx).Debugf("[cache mount] failed to set times for %s: %v", targetPath, err)
 		}
 	}
 
-	extractDone(nil)
 	return nil
 }
 

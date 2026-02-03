@@ -84,11 +84,15 @@ func (t *ImportTracker) WaitForImport(ctx context.Context, id string) bool {
 	}
 	t.mu.Unlock()
 
+	bklog.G(ctx).Debugf("[cache mount] waiting for import of %s to complete", id)
+
 	// Wait for import to complete
 	select {
 	case <-ch:
+		bklog.G(ctx).Debugf("[cache mount] import of %s completed", id)
 		return true
 	case <-ctx.Done():
+		bklog.G(ctx).Debugf("[cache mount] context cancelled while waiting for import of %s", id)
 		return false
 	}
 }
@@ -99,6 +103,33 @@ func (t *ImportTracker) IsImportPending(id string) bool {
 	defer t.mu.Unlock()
 	_, pending := t.pending[id]
 	return pending
+}
+
+// Global import tracker registry - keyed by session ID
+var (
+	globalTrackersMu sync.RWMutex
+	globalTrackers   = make(map[string]*ImportTracker)
+)
+
+// RegisterImportTracker registers an import tracker for a session
+func RegisterImportTracker(sessionID string, tracker *ImportTracker) {
+	globalTrackersMu.Lock()
+	defer globalTrackersMu.Unlock()
+	globalTrackers[sessionID] = tracker
+}
+
+// UnregisterImportTracker removes the import tracker for a session
+func UnregisterImportTracker(sessionID string) {
+	globalTrackersMu.Lock()
+	defer globalTrackersMu.Unlock()
+	delete(globalTrackers, sessionID)
+}
+
+// GetImportTracker retrieves the import tracker for a session
+func GetImportTracker(sessionID string) *ImportTracker {
+	globalTrackersMu.RLock()
+	defer globalTrackersMu.RUnlock()
+	return globalTrackers[sessionID]
 }
 
 // NewImportEntry creates a new ImportEntry
