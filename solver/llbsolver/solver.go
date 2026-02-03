@@ -63,6 +63,10 @@ type ExporterRequest struct {
 	EnableSessionExporter bool
 }
 
+// PreSolveFunc is called after the job is created but before the build starts.
+// It receives a context with progress writer attached, allowing progress to be shown.
+type PreSolveFunc func(ctx context.Context, j *solver.Job) error
+
 type RemoteCacheExporter struct {
 	remotecache.Exporter
 	solver.CacheExportMode
@@ -488,7 +492,7 @@ func (s *Solver) recordBuildHistory(ctx context.Context, id string, req frontend
 	}, nil
 }
 
-func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req frontend.SolveRequest, exp ExporterRequest, ent []entitlements.Entitlement, post []Processor, internal bool, srcPol *spb.Policy, policySession string) (_ *client.SolveResponse, err error) {
+func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req frontend.SolveRequest, exp ExporterRequest, ent []entitlements.Entitlement, post []Processor, internal bool, srcPol *spb.Policy, policySession string, preSolve PreSolveFunc) (_ *client.SolveResponse, err error) {
 	j, err := s.solver.NewJob(id)
 	if err != nil {
 		return nil, err
@@ -564,6 +568,15 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 		defer func() {
 			err = rec(context.WithoutCancel(ctx), resProv, descrefs, err)
 		}()
+	}
+
+	// Run pre-solve hook if provided (e.g., for cache mount imports)
+	if preSolve != nil {
+		if err := j.InContext(ctx, func(ctx context.Context, _ solver.JobContext) error {
+			return preSolve(ctx, j)
+		}); err != nil {
+			return nil, errors.Wrap(err, "pre-solve hook failed")
+		}
 	}
 
 	if fwd != nil {
@@ -777,7 +790,7 @@ func runCacheExporters(ctx context.Context, exporters []RemoteCacheExporter, j *
 	for i, exp := range exporters {
 		eg.Go(func() (err error) {
 			id := fmt.Sprint(j.SessionID, "-cache-", i)
-			err = inBuilderContext(ctx, j, exp.Name(), id, func(ctx context.Context, _ solver.JobContext) error {
+			err = InBuilderContext(ctx, j, exp.Name(), id, func(ctx context.Context, _ solver.JobContext) error {
 				prepareDone := progress.OneOff(ctx, "preparing build cache for export")
 				if err := result.EachRef(cached, inp, func(res solver.CachedResult, ref cache.ImmutableRef) error {
 					ctx := withDescHandlerCacheOpts(ctx, ref)
@@ -852,7 +865,7 @@ func (s *Solver) runExporters(ctx context.Context, ref string, exporters []expor
 	for i, exp := range exporters {
 		eg.Go(func() error {
 			id := fmt.Sprint(job.SessionID, "-export-", i)
-			return inBuilderContext(ctx, job, exp.Name(), id, func(ctx context.Context, _ solver.JobContext) error {
+			return InBuilderContext(ctx, job, exp.Name(), id, func(ctx context.Context, _ solver.JobContext) error {
 				span, ctx := tracing.StartSpan(ctx, exp.Name())
 				defer span.End()
 
@@ -888,7 +901,7 @@ func (s *Solver) runExporters(ctx context.Context, ref string, exporters []expor
 	}
 
 	if len(exporters) == 0 && len(warnings) > 0 {
-		err := inBuilderContext(ctx, job, "Verifying build result", identity.NewID(), func(ctx context.Context, _ solver.JobContext) error {
+		err := InBuilderContext(ctx, job, "Verifying build result", identity.NewID(), func(ctx context.Context, _ solver.JobContext) error {
 			pw, _, _ := progress.NewFromContext(ctx)
 			for _, w := range warnings {
 				pw.Write(identity.NewID(), w)
@@ -1143,7 +1156,7 @@ func (s *Solver) RunInJobContext(ctx context.Context, jobID string, name string,
 	if err != nil {
 		return err
 	}
-	return inBuilderContext(ctx, j, name, "", func(ctx context.Context, _ solver.JobContext) error {
+	return InBuilderContext(ctx, j, name, "", func(ctx context.Context, _ solver.JobContext) error {
 		return f(ctx)
 	})
 }
@@ -1169,7 +1182,9 @@ func allWorkers(wc *worker.Controller) func(func(w worker.Worker) error) error {
 	}
 }
 
-func inBuilderContext(ctx context.Context, b solver.Builder, name, id string, f func(ctx context.Context, jobCtx solver.JobContext) error) error {
+// InBuilderContext executes a function within a builder's context with progress tracking.
+// The name parameter is displayed as the vertex name in the progress output.
+func InBuilderContext(ctx context.Context, b solver.Builder, name, id string, f func(ctx context.Context, jobCtx solver.JobContext) error) error {
 	if id == "" {
 		id = name
 	}

@@ -18,6 +18,7 @@ import (
 	"github.com/mitchellh/hashstructure/v2"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	apitypes "github.com/moby/buildkit/api/types"
+	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/remotecache"
 	"github.com/moby/buildkit/cache/remotecache/cachemount"
 	"github.com/moby/buildkit/client"
@@ -394,19 +395,22 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 	translateLegacySolveRequest(req)
 
 	// Handle cache mount imports/exports if specified
-	var importWg sync.WaitGroup
 	var buildSucceeded bool // Track whether build succeeded for conditional export
+	var preSolve llbsolver.PreSolveFunc
+	var cacheMountManager *cachemount.Manager
+	var cacheMgr cache.Manager
+
 	if len(req.Cache.CacheMountImports) > 0 || len(req.Cache.CacheMountExports) > 0 {
 		w, err := c.opt.WorkerController.GetDefault()
 		if err != nil {
 			return nil, err
 		}
-		cm := w.CacheManager()
+		cacheMgr = w.CacheManager()
 		hosts := c.opt.RegistryHosts
 		if hosts == nil {
 			hosts = resolver.NewRegistryConfig(nil)
 		}
-		cacheMountManager := cachemount.NewManager(c.opt.SessionManager, hosts, nil)
+		cacheMountManager = cachemount.NewManager(c.opt.SessionManager, hosts, nil)
 
 		// Add imports and exports to the manager
 		for _, imp := range req.Cache.CacheMountImports {
@@ -416,38 +420,21 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 			cacheMountManager.AddExport(cachemount.NewExportEntry(exp.ID, exp.Type, exp.Attrs))
 		}
 
-		// Start cache mount imports in background goroutine
-		// This runs concurrently with solve and uses RunInJobContext for progress visibility
+		// Create pre-solve hook for cache mount imports
+		// This runs BEFORE the build starts, ensuring imports complete first
 		if len(req.Cache.CacheMountImports) > 0 {
-			importWg.Add(1)
-			go func() {
-				defer importWg.Done()
-				defer func() {
-					if r := recover(); r != nil {
-						bklog.G(ctx).Errorf("panic during cache mount import: %v", r)
-					}
-				}()
-
-				// Wait for session with a short timeout
-				sessionCtx, sessionCancel := context.WithTimeout(ctx, 30*time.Second)
-				_, err := c.opt.SessionManager.Get(sessionCtx, req.Session, false)
-				sessionCancel()
-				if err != nil {
-					bklog.G(ctx).WithError(err).Debug("session not ready for cache mount imports, will retry during solve")
-					return
-				}
-
+			preSolve = func(progressCtx context.Context, j *solver.Job) error {
 				g := session.NewGroup(req.Session)
 				for _, imp := range req.Cache.CacheMountImports {
 					impID := imp.ID
 					ref := imp.Attrs["ref"]
 
-					// Use RunInJobContext to show progress in client output
-					importErr := c.solver.RunInJobContext(ctx, req.Ref, fmt.Sprintf("[cache mount] importing %s", impID), func(progressCtx context.Context) error {
-						impCtx, impCancel := context.WithTimeout(progressCtx, 120*time.Second)
+					// Use InBuilderContext to show progress vertex
+					if err := llbsolver.InBuilderContext(progressCtx, j, fmt.Sprintf("[cache mount] importing %s", impID), "", func(ctx context.Context, _ solver.JobContext) error {
+						impCtx, impCancel := context.WithTimeout(ctx, 120*time.Second)
 						defer impCancel()
 
-						if imported, err := cacheMountManager.TryImport(impCtx, cm, impID, g); err != nil {
+						if imported, err := cacheMountManager.TryImport(impCtx, cacheMgr, impID, g); err != nil {
 							bklog.G(ctx).WithError(err).Debugf("failed to import cache mount %s (this is normal for first build)", impID)
 							// Return nil to not show error in progress - this is expected for first builds
 							return nil
@@ -455,27 +442,16 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 							bklog.G(ctx).Debugf("imported cache mount %s from %s", impID, ref)
 						}
 						return nil
-					})
-					if importErr != nil {
-						// Job not ready yet - fall back to non-progress import
-						bklog.G(ctx).WithError(importErr).Debugf("falling back to non-progress import for %s", impID)
-						impCtx, impCancel := context.WithTimeout(ctx, 120*time.Second)
-						if imported, err := cacheMountManager.TryImport(impCtx, cm, impID, g); err != nil {
-							bklog.G(ctx).WithError(err).Debugf("failed to import cache mount %s", impID)
-						} else if imported {
-							bklog.G(ctx).Debugf("imported cache mount %s", impID)
-						}
-						impCancel()
+					}); err != nil {
+						bklog.G(progressCtx).WithError(err).Warnf("error importing cache mount %s", impID)
 					}
 				}
-			}()
+				return nil
+			}
 		}
 
 		// Defer exports until after the solve completes (only if build succeeded)
 		defer func() {
-			// Wait for any in-progress imports to complete before exporting
-			importWg.Wait()
-
 			defer func() {
 				if r := recover(); r != nil {
 					bklog.G(ctx).Errorf("panic during cache mount export: %v", r)
@@ -498,7 +474,7 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 
 					// Use RunInJobContext to show progress in client output
 					exportErr := c.solver.RunInJobContext(ctx, req.Ref, fmt.Sprintf("[cache mount] exporting %s", expID), func(progressCtx context.Context) error {
-						result, err := cacheMountManager.ExportOne(progressCtx, cm, expID, g)
+						result, err := cacheMountManager.ExportOne(progressCtx, cacheMgr, expID, g)
 						if err != nil {
 							bklog.G(ctx).WithError(err).Warnf("failed to export cache mount %s", expID)
 							return nil // Don't fail the build for export errors
@@ -669,7 +645,7 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 		Exporters:             expis,
 		CacheExporters:        cacheExporters,
 		EnableSessionExporter: req.EnableSessionExporter,
-	}, entitlementsFromPB(req.Entitlements), procs, req.Internal, req.SourcePolicy, req.SourcePolicySession)
+	}, entitlementsFromPB(req.Entitlements), procs, req.Internal, req.SourcePolicy, req.SourcePolicySession, preSolve)
 	if err != nil {
 		return nil, err
 	}
