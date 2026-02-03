@@ -9,6 +9,7 @@ import (
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/distribution/reference"
 	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/push"
 	"github.com/moby/buildkit/util/resolver"
@@ -93,11 +94,15 @@ func RegistryCacheMountImporterFunc(sm *session.Manager, cs content.Store, hosts
 			insecure = b
 		}
 
+		bklog.G(ctx).Debugf("[cache mount import] resolving %s (insecure=%v)", refString, insecure)
+
 		scope, hosts := registryConfig(hosts, ref, resolver.ScopeType{}, insecure)
 		remote := resolver.DefaultPool.GetResolver(hosts, refString, scope, sm, g)
 
+		bklog.G(ctx).Debugf("[cache mount import] calling Resolve for %s", refString)
 		xref, desc, err := remote.Resolve(ctx, refString)
 		if err != nil {
+			bklog.G(ctx).Debugf("[cache mount import] Resolve failed for %s: %v", refString, err)
 			// Check if this is a "not found" error - this is expected for first-time builds
 			errStr := err.Error()
 			if strings.Contains(errStr, "not found") ||
@@ -110,13 +115,17 @@ func RegistryCacheMountImporterFunc(sm *session.Manager, cs content.Store, hosts
 			return nil, ocispecs.Descriptor{}, err
 		}
 
+		bklog.G(ctx).Debugf("[cache mount import] Resolve succeeded for %s, digest=%s", refString, desc.Digest)
+
 		fetcher, err := remote.Fetcher(ctx, xref)
 		if err != nil {
+			bklog.G(ctx).Debugf("[cache mount import] Fetcher failed for %s: %v", refString, err)
 			return nil, ocispecs.Descriptor{}, err
 		}
 
 		provider := contentutil.FromFetcher(limited.Default.WrapFetcher(fetcher, refString))
 
+		bklog.G(ctx).Debugf("[cache mount import] importer ready for %s", refString)
 		return &registryImporter{
 			Importer: NewImporter(provider, desc, refString),
 		}, desc, nil
