@@ -443,8 +443,8 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 					go func(impID, ref string, importDone func(bool)) {
 						// Use InBuilderContext to show progress vertex
 						err := llbsolver.InBuilderContext(progressCtx, j, fmt.Sprintf("[cache mount] importing %s", impID), "", func(ctx context.Context, _ solver.JobContext) error {
-							// Use 10 minute timeout for large cache imports
-							impCtx, impCancel := context.WithTimeout(ctx, 600*time.Second)
+							// Use 30 minute timeout for large cache imports (e.g., multi-GB caches)
+							impCtx, impCancel := context.WithTimeout(ctx, 1800*time.Second)
 							defer impCancel()
 
 							if imported, err := cacheMountManager.TryImport(impCtx, cacheMgr, impID, g); err != nil {
@@ -645,25 +645,31 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 			}()
 
 			g := session.NewGroup(req.Session)
-			bklog.G(ctx).Debugf("[cache mount] running exports for %d entries", len(req.Cache.CacheMountExports))
+			exportStartTime := time.Now()
+			bklog.G(ctx).Infof("[cache mount] starting exports for %d cache mount(s)", len(req.Cache.CacheMountExports))
 
 			for _, exp := range req.Cache.CacheMountExports {
 				expID := exp.ID
 				ref := exp.Attrs["ref"]
 
 				// Use RunInJobContext to show progress in client output
-				// Add a 10 minute timeout for large cache exports
+				// Use 30 minute timeout for large cache exports (e.g., multi-GB caches)
 				exportErr := c.solver.RunInJobContext(ctx, req.Ref, fmt.Sprintf("[cache mount] exporting %s", expID), func(progressCtx context.Context) error {
-					exportCtx, exportCancel := context.WithTimeout(progressCtx, 600*time.Second)
+					exportCtx, exportCancel := context.WithTimeout(progressCtx, 1800*time.Second)
 					defer exportCancel()
+
+					itemStartTime := time.Now()
+					bklog.G(exportCtx).Infof("[cache mount] starting export of %s to %s", expID, ref)
 
 					result, err := cacheMountManager.ExportOne(exportCtx, cacheMgr, expID, g)
 					if err != nil {
-						bklog.G(exportCtx).WithError(err).Warnf("[cache mount] failed to export %s", expID)
+						elapsed := time.Since(itemStartTime)
+						bklog.G(exportCtx).WithError(err).Warnf("[cache mount] failed to export %s after %s", expID, elapsed.Round(time.Millisecond))
 						return nil // Don't fail the build for export errors
 					}
 					if result != nil {
-						bklog.G(exportCtx).Infof("[cache mount] exported %s to %s (digest: %s)", expID, ref, result.Digest)
+						elapsed := time.Since(itemStartTime)
+						bklog.G(exportCtx).Infof("[cache mount] finished export of %s to %s (digest: %s) in %s", expID, ref, result.Digest, elapsed.Round(time.Millisecond))
 					}
 					return nil
 				})
@@ -671,6 +677,9 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 					bklog.G(ctx).WithError(exportErr).Warnf("[cache mount] failed to run export in job context for %s", expID)
 				}
 			}
+
+			totalElapsed := time.Since(exportStartTime)
+			bklog.G(ctx).Infof("[cache mount] completed all exports in %s", totalElapsed.Round(time.Millisecond))
 		}()
 	}
 
