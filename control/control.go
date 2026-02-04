@@ -427,8 +427,11 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 
 			// Register tracker globally with session ID so MountableCache can find it
 			cachemount.RegisterImportTracker(req.Session, importTracker)
+		}
 
-			preSolve = func(progressCtx context.Context, j *solver.Job) (context.Context, error) {
+		// Set up preSolve to start imports in background
+		preSolve = func(progressCtx context.Context, j *solver.Job) (context.Context, error) {
+			if len(req.Cache.CacheMountImports) > 0 {
 				g := session.NewGroup(req.Session)
 
 				// Start all imports in background goroutines
@@ -463,9 +466,9 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 						}
 					}(impID, ref, importDone)
 				}
-
-				return ctx, nil
 			}
+
+			return ctx, nil
 		}
 
 		// Defer cleanup only - exports will run inline after solve
@@ -636,6 +639,9 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 	}
 
 	// Run cache mount exports BEFORE returning (session must still be active)
+	// Note: Export progress is not visible in client output because the progress stream
+	// ends when solve completes. However, exports complete before returning and the
+	// client waits. Server logs show all progress details.
 	if cacheMountManager != nil && len(req.Cache.CacheMountExports) > 0 {
 		func() {
 			defer func() {
@@ -652,29 +658,20 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 				expID := exp.ID
 				ref := exp.Attrs["ref"]
 
-				// Use RunInJobContext to show progress in client output
 				// Use 30 minute timeout for large cache exports (e.g., multi-GB caches)
-				exportErr := c.solver.RunInJobContext(ctx, req.Ref, fmt.Sprintf("[cache mount] exporting %s", expID), func(progressCtx context.Context) error {
-					exportCtx, exportCancel := context.WithTimeout(progressCtx, 1800*time.Second)
-					defer exportCancel()
+				exportCtx, exportCancel := context.WithTimeout(ctx, 1800*time.Second)
 
-					itemStartTime := time.Now()
-					bklog.G(exportCtx).Infof("[cache mount] starting export of %s to %s", expID, ref)
+				bklog.G(exportCtx).Infof("[cache mount] starting export of %s to %s", expID, ref)
 
-					result, err := cacheMountManager.ExportOne(exportCtx, cacheMgr, expID, g)
-					if err != nil {
-						elapsed := time.Since(itemStartTime)
-						bklog.G(exportCtx).WithError(err).Warnf("[cache mount] failed to export %s after %s", expID, elapsed.Round(time.Millisecond))
-						return nil // Don't fail the build for export errors
-					}
-					if result != nil {
-						elapsed := time.Since(itemStartTime)
-						bklog.G(exportCtx).Infof("[cache mount] finished export of %s to %s (digest: %s) in %s", expID, ref, result.Digest, elapsed.Round(time.Millisecond))
-					}
-					return nil
-				})
-				if exportErr != nil {
-					bklog.G(ctx).WithError(exportErr).Warnf("[cache mount] failed to run export in job context for %s", expID)
+				result, err := cacheMountManager.ExportOne(exportCtx, cacheMgr, expID, g)
+				exportCancel()
+
+				if err != nil {
+					elapsed := time.Since(exportStartTime)
+					bklog.G(ctx).WithError(err).Warnf("[cache mount] failed to export %s after %s", expID, elapsed.Round(time.Millisecond))
+				} else if result != nil {
+					elapsed := time.Since(exportStartTime)
+					bklog.G(ctx).Infof("[cache mount] finished export of %s to %s (digest: %s) in %s", expID, ref, result.Digest, elapsed.Round(time.Millisecond))
 				}
 			}
 

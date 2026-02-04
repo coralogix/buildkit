@@ -2,7 +2,6 @@ package cachemount
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -13,7 +12,6 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/util/bklog"
-	"github.com/moby/buildkit/util/progress"
 	"github.com/pkg/errors"
 )
 
@@ -279,7 +277,6 @@ func (m *Manager) performImport(ctx context.Context, cm cache.Manager, entry *Im
 	switch entry.Type {
 	case "registry":
 		ref := entry.Attrs["ref"]
-		importDone := progress.OneOff(ctx, fmt.Sprintf("[cache mount] importing %s from %s", entry.ID, ref))
 		startTime := time.Now()
 
 		bklog.G(ctx).Infof("[cache mount] importing %s from %s", entry.ID, ref)
@@ -289,30 +286,25 @@ func (m *Manager) performImport(ctx context.Context, cm cache.Manager, entry *Im
 		if err != nil {
 			// If the cache doesn't exist in the registry, that's expected for first-time builds
 			if errors.Is(err, ErrCacheNotFound) {
-				importDone(nil) // Mark as done without error
 				bklog.G(ctx).Infof("[cache mount] %s not found in registry (first build?), skipping import", entry.ID)
 				return nil
 			}
-			importDone(err)
 			return errors.Wrapf(err, "failed to create registry importer for %s", entry.ID)
 		}
 
 		// Get or create the cache mount ref (createIfMissing=true for imports)
 		destPath, cleanup, err := m.getCacheMountPath(ctx, cm, entry.ID, g, true)
 		if err != nil {
-			importDone(err)
 			return errors.Wrapf(err, "failed to get cache mount path for import: %s", entry.ID)
 		}
 		defer cleanup()
 
 		// Perform the import
 		if err := importer.Import(ctx, entry.ID, destPath); err != nil {
-			importDone(err)
 			return errors.Wrapf(err, "failed to import cache mount %s", entry.ID)
 		}
 
 		elapsed := time.Since(startTime)
-		importDone(nil)
 		bklog.G(ctx).Infof("[cache mount] successfully imported %s in %s", entry.ID, elapsed.Round(time.Millisecond))
 		return nil
 	default:
@@ -385,8 +377,6 @@ func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *Ex
 		sourcePath, cleanup, err := m.getCacheMountPath(ctx, cm, entry.ID, g, false)
 		if err != nil {
 			if errors.Is(err, ErrCacheMountNotFound) {
-				skipDone := progress.OneOff(ctx, fmt.Sprintf("[cache mount] skipping %s: not found", entry.ID))
-				skipDone(nil)
 				bklog.G(ctx).Infof("[cache mount] skipping export of %s: cache mount not used", entry.ID)
 				return nil, nil
 			}
@@ -394,15 +384,12 @@ func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *Ex
 		}
 		defer cleanup()
 
-		exportDone := progress.OneOff(ctx, fmt.Sprintf("[cache mount] exporting %s to %s", entry.ID, ref))
 		startTime := time.Now()
-
 		bklog.G(ctx).Infof("[cache mount] exporting %s to %s", entry.ID, ref)
 
 		exporterFunc := RegistryCacheMountExporterFunc(m.sm, m.hosts)
 		exporter, err := exporterFunc(ctx, g, entry.Attrs)
 		if err != nil {
-			exportDone(err)
 			return nil, errors.Wrapf(err, "failed to create registry exporter for %s", entry.ID)
 		}
 
@@ -411,21 +398,17 @@ func (m *Manager) performExport(ctx context.Context, cm cache.Manager, entry *Ex
 		if err != nil {
 			// Handle empty cache mount gracefully
 			if errors.Is(err, ErrCacheMountEmpty) {
-				exportDone(nil)
 				bklog.G(ctx).Infof("[cache mount] skipping export of %s: directory is empty", entry.ID)
 				return nil, nil
 			}
-			exportDone(err)
 			return nil, errors.Wrapf(err, "failed to export cache mount %s", entry.ID)
 		}
 
 		if _, err := exporter.Finalize(ctx); err != nil {
-			exportDone(err)
 			return nil, errors.Wrapf(err, "failed to finalize cache mount export %s", entry.ID)
 		}
 
 		elapsed := time.Since(startTime)
-		exportDone(nil)
 		bklog.G(ctx).Infof("[cache mount] successfully exported %s to %s in %s", entry.ID, ref, elapsed.Round(time.Millisecond))
 		return &ExportResult{
 			ID:     entry.ID,
