@@ -395,7 +395,6 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 	translateLegacySolveRequest(req)
 
 	// Handle cache mount imports/exports if specified
-	var buildSucceeded bool // Track whether build succeeded for conditional export
 	var preSolve llbsolver.PreSolveFunc
 	var cacheMountManager *cachemount.Manager
 	var cacheMgr cache.Manager
@@ -469,49 +468,11 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 			}
 		}
 
-		// Defer cleanup and exports until after the solve completes
+		// Defer cleanup only - exports will run inline after solve
 		defer func() {
-			defer func() {
-				if r := recover(); r != nil {
-					bklog.G(ctx).Errorf("panic during cache mount export: %v", r)
-				}
-			}()
-
 			// Always unregister the import tracker when done
 			if importTracker != nil {
 				cachemount.UnregisterImportTracker(req.Session)
-			}
-
-			// Only export if build succeeded
-			if !buildSucceeded {
-				bklog.G(ctx).Debug("skipping cache mount exports because build failed")
-				return
-			}
-
-			if len(req.Cache.CacheMountExports) > 0 {
-				g := session.NewGroup(req.Session)
-				bklog.G(ctx).Debugf("[cache mount] running exports for %d entries", len(req.Cache.CacheMountExports))
-
-				for _, exp := range req.Cache.CacheMountExports {
-					expID := exp.ID
-					ref := exp.Attrs["ref"]
-
-					// Use RunInJobContext to show progress in client output
-					exportErr := c.solver.RunInJobContext(ctx, req.Ref, fmt.Sprintf("[cache mount] exporting %s", expID), func(progressCtx context.Context) error {
-						result, err := cacheMountManager.ExportOne(progressCtx, cacheMgr, expID, g)
-						if err != nil {
-							bklog.G(ctx).WithError(err).Warnf("[cache mount] failed to export %s", expID)
-							return nil // Don't fail the build for export errors
-						}
-						if result != nil {
-							bklog.G(ctx).Infof("[cache mount] exported %s to %s (digest: %s)", expID, ref, result.Digest)
-						}
-						return nil
-					})
-					if exportErr != nil {
-						bklog.G(ctx).WithError(exportErr).Warnf("[cache mount] failed to run export in job context for %s", expID)
-					}
-				}
 			}
 		}()
 	}
@@ -673,8 +634,46 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 	if err != nil {
 		return nil, err
 	}
-	// Mark build as succeeded so cache mount exports will run
-	buildSucceeded = true
+
+	// Run cache mount exports BEFORE returning (session must still be active)
+	if cacheMountManager != nil && len(req.Cache.CacheMountExports) > 0 {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					bklog.G(ctx).Errorf("panic during cache mount export: %v", r)
+				}
+			}()
+
+			g := session.NewGroup(req.Session)
+			bklog.G(ctx).Debugf("[cache mount] running exports for %d entries", len(req.Cache.CacheMountExports))
+
+			for _, exp := range req.Cache.CacheMountExports {
+				expID := exp.ID
+				ref := exp.Attrs["ref"]
+
+				// Use RunInJobContext to show progress in client output
+				// Add a 10 minute timeout for large cache exports
+				exportErr := c.solver.RunInJobContext(ctx, req.Ref, fmt.Sprintf("[cache mount] exporting %s", expID), func(progressCtx context.Context) error {
+					exportCtx, exportCancel := context.WithTimeout(progressCtx, 600*time.Second)
+					defer exportCancel()
+
+					result, err := cacheMountManager.ExportOne(exportCtx, cacheMgr, expID, g)
+					if err != nil {
+						bklog.G(exportCtx).WithError(err).Warnf("[cache mount] failed to export %s", expID)
+						return nil // Don't fail the build for export errors
+					}
+					if result != nil {
+						bklog.G(exportCtx).Infof("[cache mount] exported %s to %s (digest: %s)", expID, ref, result.Digest)
+					}
+					return nil
+				})
+				if exportErr != nil {
+					bklog.G(ctx).WithError(exportErr).Warnf("[cache mount] failed to run export in job context for %s", expID)
+				}
+			}
+		}()
+	}
+
 	return &controlapi.SolveResponse{
 		ExporterResponse: resp.ExporterResponse,
 	}, nil

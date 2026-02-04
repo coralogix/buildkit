@@ -53,6 +53,24 @@ func RegistryCacheMountExporterFunc(sm *session.Manager, hosts docker.RegistryHo
 
 		scope, hosts := registryConfig(hosts, ref, resolver.ScopeType{Push: true}, insecure)
 		remote := resolver.DefaultPool.GetResolver(hosts, refString, scope, sm, g)
+
+		// Pre-authenticate with registry by calling Resolve first
+		// This triggers the auth flow and caches credentials for subsequent Push operations
+		// Note: The ref may not exist yet (404 is expected for new caches), but auth will still be cached
+		bklog.G(ctx).Debugf("[cache mount export] pre-authenticating with registry for %s", refString)
+		_, _, resolveErr := remote.Resolve(ctx, refString)
+		if resolveErr != nil {
+			// 404/not found is expected for new cache tags - ignore it
+			// Other errors (including auth errors) should be logged but we'll try pushing anyway
+			errStr := resolveErr.Error()
+			if !strings.Contains(errStr, "not found") &&
+				!strings.Contains(errStr, "404") &&
+				!strings.Contains(errStr, "manifest unknown") &&
+				!strings.Contains(errStr, "MANIFEST_UNKNOWN") {
+				bklog.G(ctx).Debugf("[cache mount export] pre-auth resolve returned error (may still push): %v", resolveErr)
+			}
+		}
+
 		pusher, err := push.Pusher(ctx, remote, refString)
 		if err != nil {
 			return nil, err
